@@ -4,6 +4,10 @@ All notable changes are in this file. The format follows Keep a Changelog. Versi
 
 ## Unreleased
 
+### Changed
+
+- nxkit is licensed under GPL-3.0-only. Releases up to 0.9.2 stay under MIT. Code ported from Ryujinx and nxnative keeps its MIT notice in `THIRD_PARTY.md`.
+
 ## 0.9.2 - 2026-11-07
 
 ### Fixed

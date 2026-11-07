@@ -308,4 +308,5 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) before you open a pull request. To repor
 
 ## License
 
-MIT. See [LICENSE](LICENSE). Notes about formats and external tools are in [THIRD_PARTY.md](THIRD_PARTY.md).
+GPL-3.0-only. See [LICENSE](LICENSE). Anyone may use nxkit. Whoever passes on a changed version must publish its source under the same licence.
+Releases up to 0.9.2 were published under MIT and stay under MIT. Notes about formats, external tools and the MIT parts are in [THIRD_PARTY.md](THIRD_PARTY.md).

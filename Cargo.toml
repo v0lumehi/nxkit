@@ -67,4 +67,5 @@ nxb-maxwell = { path = "crates/nxb-maxwell" }
 opt-level = 1
 
 [profile.release]
+lto = "fat"
 debug = "line-tables-only"

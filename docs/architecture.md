@@ -7,7 +7,7 @@ For the decisions behind this structure, refer to [decisions.md](decisions.md).
 
 - The repository is one Cargo workspace. The crates of the build are in `crates/`. The families and title modules are in `titles/` (refer to [titles.md](titles.md)). The developer tools are in `xtask/`.
 - Each crate has the name `nxb-<concern>`. The front-end crates of layer F keep their names (`msl-*`, `air-*`, `airc`, `mslcheck`).
-- `nxb-cli` makes the one program, `nxb`. Each stage is a command of `nxb`: `build`, `extract`, `split`, `rewrite`, `profile`, `rewrite-rules`, `nro`, `shaders`, `app`, `ipa`, `sign`, `pso`, `archive`, `ios` and `airc`. The other commands are `cache`, `prune`, `regressions`, `self-check` and `version`. The stage crates are libraries, and `nxb-cli` calls them. The stages have no other program and no dispatch by the program name. The front-end crates `airc` and `mslcheck` also build their own programs.
+- `nxb-cli` makes the one program, `nxb`. Each stage is a command of `nxb`: `build`, `extract`, `split`, `rewrite`, `romfs`, `profile`, `rewrite-rules`, `nro`, `shaders`, `app`, `ipa`, `sign`, `pso`, `archive`, `ios` and `airc`. The other commands are `cache`, `prune`, `regressions`, `self-check` and `version`. The stage crates are libraries, and `nxb-cli` calls them. The stages have no other program and no dispatch by the program name. The front-end crates `airc` and `mslcheck` also build their own programs.
 - The workspace uses the standard library only. At this time, it has no external crates.
 
 ## Layers
@@ -75,7 +75,7 @@ The rules:
 |---|---|---|---|---|
 | nxb-model | L0 | yes | impl | identifiers (`ShaderKey`, `TitleId`, `Target`, `StageId`), `Digest`, own SHA-256, `ContentKey`, `HashingWriter` |
 | nxb-error | L0 | yes | impl | error classes, reason strings, `BuildError`, `EnvError` with errno classes |
-| nxb-sys | L0 | no | impl | process groups, memory size, core counts, locks, clonefile, zlib, AES, SHA instructions |
+| nxb-sys | L0 | no | impl | process groups, memory size, core counts, locks, clonefile, exclusive publication, zlib, optional libzstd, AES, SHA instructions |
 | nxb-maxwell | L0 | yes | impl | decoders for Maxwell and Ampere (sm_86) machine code of the game GPU |
 | nxb-pyjson | L1 | yes | impl | a JSON writer that gives the same bytes as Python `json.dumps`. Measured: byte-identical on 16,269 JSON files of the reference title. |
 | nxb-shader | L1 | yes | impl | the job writer, the chain version, guards, the header, the target conventions, the side library cut |
@@ -84,7 +84,8 @@ The rules:
 | nxb-a64 | L1 | no | impl | an AArch64 decoder and the encoders for the rewrite step. It follows Capstone 5 for the fields that the rewriter uses |
 | nxb-rewrite | L1 | no | impl | the code rewrite: NSO and NRO load, rules as data, the five tables |
 | nxb-codec | L1 | no | impl | the ZBIC decoder (`nxb_codec::zbic`). The other codec modules are empty. |
-| nxb-crypto, nxb-plist, nxb-hos, nxb-romfs, nxb-bundle, nxb-zip, nxb-pso | L1 | no | skel | pure domain logic. Some of it is in the stage crates at this time. |
+| nxb-romfs | L1 | no | impl | hash-checked, in-place resource edits over caller-owned bytes |
+| nxb-crypto, nxb-plist, nxb-hos, nxb-bundle, nxb-zip, nxb-pso | L1 | no | skel | pure domain logic. Some of it is in the stage crates at this time. |
 | nxb-split | L1 | no | impl | containers, shader keys, package records and tables. It supports many container families (refer to [pipeline-stages.md](pipeline-stages.md)). Formats that are not ported stop with a named `Unsupported` error and exit code 4. |
 | nxb-obs | L2 | no | impl | NDJSON events, sinks and the code table (`code` and `severity`) |
 | nxb-nro | L2 | no | impl | the NRO collection (`nxb nro`) |
@@ -98,7 +99,7 @@ The rules:
 | nxb-extract | L3 | no | impl | extract and fused split for NSP, XCI, NSZ, NUP and dump folders. The commands are `nxb extract` and `nxb split` |
 | nxb-pack | L3 | no | impl | the Mac app stage, the ad-hoc signer, the IPA writer |
 | nxb-archive | L3 | no | impl | the pipeline archive: plan, batches, merge |
-| nxb-build | L3 | no | impl | the orchestrator `nxb build`, the rewrite step, the host stages and the iOS stages |
+| nxb-build | L3 | no | impl | the orchestrator `nxb build`, the rewrite step, opt-in resource overlays, the host stages and the iOS stages |
 | nxtitle | L1 | no | impl | the title API: `Family`, `Title`, the hooks, `Fact` and `Evidence`, the `Catalog` that composes them. Refer to [titles.md](titles.md) |
 | nxtitles | L1 | no | impl | the registry: one cargo feature per family and title module |
 | nxfamily-agl | T | no | impl | the family of Nintendo EPD games on sead, agl and gsys |

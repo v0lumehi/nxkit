@@ -81,6 +81,15 @@ and refuses to run (exit code 4) when they differ. The same notice is in `data/r
 |---|---|---|
 | Apple tools (`metal`, `metallib`, `air-opt`, `air-as`, `codesign`, `metal-tt`, `metal-pack`, `xcrun`) | Apple licence | started from your own Xcode. Not redistributed |
 
+## Optional native libraries
+
+| library | version | licence | use |
+|---|---|---|---|
+| libzstd | 1.5.7 | [BSD-3-Clause](https://github.com/facebook/zstd/blob/v1.5.7/LICENSE) | `nxb-sys` loads the library selected with `--zstd-library` for fixed-scale resource overlays. Other commands do not load it |
+
+The bindings use the public `zstd.h` API. No library code or binary is part of nxkit.
+The version check and the one-shot dictionary API preserve the reference compressed bytes.
+
 ## Code first published under MIT
 
 nxkit was published under the MIT licence up to version 0.9.2. Those releases stay under MIT. Later versions are under

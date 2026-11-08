@@ -20,3 +20,12 @@ licence = "GPL-3.0-only (same workspace)"
 unsafe = "0 (forbid(unsafe_code))"
 owner = "project team"
 used_by = ["nxb-cli (cargo feature air-front, on by default)"]
+
+[libzstd]
+reason = "optional reference-compatible resource recompression for nxb romfs fixed-scale"
+source = "user-installed native library. No library code or binary is redistributed"
+version = "1.5.7, checked before compression"
+licence = "BSD-3-Clause"
+unsafe = "native C dependency. Rust FFI and loading are confined to nxb-sys::zstd"
+owner = "project team"
+used_by = ["nxb-sys (loaded only through the explicit --zstd-library option)"]

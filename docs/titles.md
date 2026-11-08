@@ -30,6 +30,7 @@ A family and a title answer questions through hooks. `None` means no opinion.
 | `shader_role` | `BuildHooks` | what a shader does for the frame, for example the game's own upscaler |
 | `seeds` | `BuildHooks` | shaders to prepare before the first frame |
 | `rewrite_rules` | `BuildHooks` | rewriter rules as TOML text |
+| `fixed_resolution` | `BuildHooks` | recorded resource hashes and scale-field offsets for an explicit fixed-resolution overlay |
 | `needs` | `RuntimeHooks` | host behaviours the game depends on, with the setting |
 | `upscaler` | `RuntimeHooks` | keep the game's upscaler, render at the output size, or use MetalFX |
 | `pacing` | `RuntimeHooks` | the game, the display or a fixed rate paces the frames |
@@ -77,6 +78,48 @@ The Nintendo Switch 2 game on NVN2, family `agl`. The records are in `seedds/nxn
 
 - The family marks the `agl_ndsr_vr` networks as the game's upscaler. The archive path that identifies them is unverified.
 - The title states `gpu_timestamps`, `draw_barriers`, `mem_map_limit`, `render_cond`, `tex_flush_upload` and `tex_dirty_upload`. The last three come from agl's depth prepass and the terrain maps the CPU writes. They are title facts, because Breath of the Wild sets none of them.
+
+### Fixed-resolution overlay
+
+`nxb romfs fixed-scale` pins the recorded dynamic-resolution palette to a chosen scale.
+The command is opt-in. It does not alter the source image, shader caches or stock builds.
+It preserves resolution initialization, timing and load thresholds.
+
+The recorded assets are from v131072. The command checks the Bootup archive, dictionary
+member and target member hashes. Another update is not supported until its assets are recorded.
+It edits ten float fields in place. All other archive bytes stay unchanged before compression.
+
+On macOS, install libzstd 1.5.7 and select its trusted native library file explicitly.
+For Homebrew, the file is `$(brew --prefix zstd)/lib/libzstd.dylib`.
+The command checks the loaded version. It uses the same one-shot dictionary API as the
+reference overlay, not the CLI's streaming encoder.
+
+```sh
+nxb romfs fixed-scale \
+  --title-id 0400486024DEC000 \
+  --romfs "$ROMFS" \
+  --scale 0.666667 \
+  --zstd-library "$ZSTD_LIBRARY" \
+  --out "$NEW_OVERLAY"
+```
+
+`ROMFS` can name a RomFS image or a loose folder. `NEW_OVERLAY` must not exist.
+Its parent must exist and must be outside a loose source folder.
+The scale must be finite, greater than zero and no greater than one.
+
+The output contains `Pack/Bootup.Nin_Ounce_NVN2.pack.zs` and `env.txt`.
+Use that file as the host's environment file, or set its `DM_ROMFS_OVERLAY` value
+when you launch the development host. The host must support that option.
+The command does not launch the game or add the overlay to an app bundle.
+Omit the environment override to restore stock resources.
+
+A fixed scale does not guarantee an output resolution, a frame rate or stable frame times.
+A higher scale can increase GPU work.
+
+The real-data test reads `NXB_PARITY_RESOLUTION_ROMFS`, `NXB_PARITY_RESOLUTION_REFERENCE`
+and `NXB_PARITY_ZSTD_LIBRARY`. It compares the complete compressed output at scale
+0.666667 against the retained reference overlay. It skips itself when these inputs are absent.
+No game files belong in the repository.
 
 Open questions:
 

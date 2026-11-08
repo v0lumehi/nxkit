@@ -10,6 +10,7 @@
 //! | `extract` | `nxb_extract::cli::main` |
 //! | `split` | `nxb_extract::split_cli::main` |
 //! | `rewrite`, `nro`, `rewrite-rules` | `nxb_build::rewrite` |
+//! | `romfs fixed-scale` | `nxb_build::romfs_overlay` |
 //! | `shaders guards|own-verdicts|build` | this crate (the shader-step command line) |
 //! | `app` | `nxb_pack::cli::macapp::main` |
 //! | `ipa` | `nxb_pack::cli::ipa::main` |
@@ -137,6 +138,8 @@ pub fn run(bin: Binary, args: &[String], out: &mut dyn Write, err: &mut dyn Writ
         "nro" if bin == Binary::Nxb => return nxb_build::rewrite::nro_main(rest),
         // the registered patches as private rule files
         "rewrite-rules" if bin == Binary::Nxb => return nxb_build::rewrite::rules_main(rest),
+        // Opt-in resource overlays. The stock RomFS and build graph stay unchanged.
+        "romfs" if bin == Binary::Nxb => return nxb_build::romfs_overlay::main(rest),
         // the provisional profile of a game with no profile (guess, show, check, manifest)
         "profile" if bin == Binary::Nxb => return nxb_build::host::profile_cli::main(rest),
         // pack and sign stages

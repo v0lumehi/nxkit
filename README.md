@@ -188,6 +188,7 @@ The tests for this are small. Refer to the section 0.5.0 of the changelog.
 | `nxb extract` | NSP, XCI, NSZ, XCZ, Switch 2 package (`.nup`, no keys needed) or dump folder (`--dump`) to RomFS images, ExeFS, control data and icon |
 | `nxb split` | shader split of extracted images into package records and tables. Exit code 4 means unsupported format |
 | `nxb rewrite`, `nxb rewrite-rules`, `nxb nro` | the code rewrite step, the rule files and the NRO collection |
+| `nxb romfs fixed-scale` | prepare a verified, opt-in fixed-resolution overlay. It does not edit the source image or rebuild shaders. Requires macOS and an explicit libzstd 1.5.7 path. Refer to [docs/titles.md](docs/titles.md#fixed-resolution-overlay) |
 | `nxb shaders` | the shader step: `build`, `guards`, `own-verdicts` |
 | `nxb pso`, `nxb archive` | plan and merge of the pipeline archive, and one archive from a script. They need `metal-tt` and `metal-pack` |
 | `nxb app` | the Mac app stage |

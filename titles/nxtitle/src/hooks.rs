@@ -1,6 +1,6 @@
 //! The questions a family or title answers. Every method has a default of "no opinion".
 
-use crate::{Fact, Runtime, Service};
+use crate::{Fact, FixedResolution, Runtime, Service};
 
 /// A shader stage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,6 +101,10 @@ pub trait BuildHooks: Sync {
     }
     /// Rewriter rules as TOML text (`rules/*.toml` shape). Rules of all layers add up.
     fn rewrite_rules(&self) -> Option<&'static str> {
+        None
+    }
+    /// Resource edits for an opt-in fixed resolution. The default leaves the game unchanged.
+    fn fixed_resolution(&self) -> Option<Fact<FixedResolution>> {
         None
     }
 }

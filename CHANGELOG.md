@@ -4,6 +4,10 @@ All notable changes are in this file. The format follows Keep a Changelog. Versi
 
 ## Unreleased
 
+### Added
+
+- `nxb romfs fixed-scale` prepares an opt-in fixed-resolution overlay for Ocarina of Time (`0400486024DEC000`, recorded v131072 assets). It changes the scale palette only. It leaves resolution initialization, timing and load thresholds unchanged. The command verifies source hashes, uses the optional libzstd 1.5.7 library on macOS and publishes a new overlay directory with `env.txt`. Stock builds and shader caches stay unchanged.
+
 ## 0.9.3 - 2026-11-08
 
 ### Fixed

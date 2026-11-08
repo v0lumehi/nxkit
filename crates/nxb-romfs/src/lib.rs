@@ -1,7 +1,9 @@
-//! RomFS tables, the host's `DMROMFS1` image layout planned before any data is read, and `romfs.id`.
+//! RomFS metadata and verified resource edits.
 //!
-//! Status: skeleton. The modules below are placeholders that fix the crate's shape, see
-//! `docs/workspace-layout.md` for the planned public surface.
+//! [`patch`] edits declared float words in a source asset with a known digest.
+//! The image tables, layout and identity modules remain planned.
+
+pub mod patch;
 
 /// Nintendo RomFS directory and file tables.
 pub mod tables {}

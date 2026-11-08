@@ -22,6 +22,7 @@ mod catalog;
 mod evidence;
 mod facts;
 mod hooks;
+mod romfs;
 mod runtime;
 
 pub use catalog::{Catalog, FamilyFrom, Resolved};
@@ -31,7 +32,8 @@ pub use hooks::{
     BuildHooks, Need, Pacing, RuntimeHooks, Seed, ShaderRole, ShaderStage, ShaderView, Upscaler,
 };
 
-pub use nxb_model::TitleId;
+pub use nxb_model::{Digest, TitleId};
+pub use romfs::FixedResolution;
 pub use runtime::{Runtime, Service};
 
 /// An engine family: the facts and hooks that hold for every game of one engine.

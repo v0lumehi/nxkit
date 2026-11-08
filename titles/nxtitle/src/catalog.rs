@@ -1,8 +1,8 @@
 //! The catalog: families and titles, and how they are composed for one game.
 
 use crate::{
-    BuildHooks, Fact, Family, Match, Need, Pacing, Runtime, RuntimeHooks, Seed, Service,
-    ShaderRole, ShaderView, Title, TitleFacts, Upscaler,
+    BuildHooks, Fact, Family, FixedResolution, Match, Need, Pacing, Runtime, RuntimeHooks, Seed,
+    Service, ShaderRole, ShaderView, Title, TitleFacts, Upscaler,
 };
 use std::collections::BTreeSet;
 
@@ -142,6 +142,10 @@ impl Resolved {
     /// The role of a shader.
     pub fn shader_role(&self, shader: &ShaderView<'_>) -> Option<Fact<ShaderRole>> {
         self.build_hooks().find_map(|h| h.shader_role(shader))
+    }
+    /// The title's fixed-resolution resource edits, then the family's, or no overlay.
+    pub fn fixed_resolution(&self) -> Option<Fact<FixedResolution>> {
+        self.build_hooks().find_map(|h| h.fixed_resolution())
     }
 
     /// The seeds of the family, then the title's.

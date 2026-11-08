@@ -67,6 +67,12 @@ pub const NXB: &[Cmd] = &[
         "usage: nxb rewrite-rules <snapshot.tsv> <out dir>",
     ),
     c(
+        "romfs",
+        "Stages",
+        "prepare a verified fixed-scale resource overlay without changing the game image",
+        "usage: nxb romfs fixed-scale --title-id ID --romfs IMAGE_OR_FOLDER --scale F --zstd-library LIB --out NEW_DIR\n  scale: finite, greater than 0, up to 1. The output parent must exist\n  library: trusted libzstd 1.5.7 file. macOS only\n  output: one archive and env.txt for DM_ROMFS_OVERLAY\n  exit codes: 0 done, 1 error, 2 bad arguments, 4 unsupported title or asset",
+    ),
+    c(
         "nro",
         "Stages",
         "collect the NROs of a RomFS image (nro_collect)",

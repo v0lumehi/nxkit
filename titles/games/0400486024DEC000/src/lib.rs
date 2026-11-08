@@ -7,7 +7,9 @@
 //! The upscaler choice and the frame pacing have no answer yet, so the core defaults apply. The seed list for the
 //! prepare step is `pso_manifest.tsv` in `seedds/nxnative` `dm/games/0400486024DEC000/`.
 
-use nxtitle::{BuildHooks, Evidence, Fact, Need, RuntimeHooks, Title, TitleId};
+use nxtitle::{BuildHooks, Evidence, Fact, FixedResolution, Need, RuntimeHooks, Title, TitleId};
+
+mod resolution;
 
 /// The title module.
 pub struct Oot;
@@ -77,7 +79,11 @@ const NEEDS: &[Fact<Need>] = &[
     ),
 ];
 
-impl BuildHooks for Oot {}
+impl BuildHooks for Oot {
+    fn fixed_resolution(&self) -> Option<Fact<FixedResolution>> {
+        Some(resolution::FIXED_RESOLUTION)
+    }
+}
 
 impl RuntimeHooks for Oot {
     fn needs(&self) -> &'static [Fact<Need>] {

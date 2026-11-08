@@ -364,11 +364,15 @@ dependencies = [
  "nxb-profile",
  "nxb-pyjson",
  "nxb-rewrite",
+ "nxb-romfs",
  "nxb-sched",
  "nxb-shader",
+ "nxb-split",
  "nxb-stages",
  "nxb-sys",
  "nxb-tool",
+ "nxtitle",
+ "nxtitles",
 ]
 
 [[package]]

@@ -40,6 +40,7 @@ pub mod pipeline;
 mod programs;
 mod provisional;
 pub mod rewrite;
+pub mod romfs_overlay;
 mod stages;
 mod versions;
 

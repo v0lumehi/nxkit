@@ -15,14 +15,14 @@ use nxb_model::sha256;
 use nxb_rewrite::{Options, RewriteError, patches::PatchTable, rewrite};
 
 /// The SHA-256 of the engine files (`dm/tools`) this port was checked against: the engine at its pinned commit
-/// (nxnative `88c7e03f`). The first `SOURCES` of them are the ones `build_src.sha256` lists, in the script's order.
+/// (nxnative `f25fa956`). The first `SOURCES` of them are the ones `build_src.sha256` lists, in the script's order.
 /// When one differs, `nxb rewrite` stops with exit code 4 naming the file and both hashes, and `nxb build` stops at
 /// the rewrite with the same message and exit code 1: the rewriter is checked against the new engine files (diff them, port what
 /// changed, run the oracle on real modules) and these pins are updated with it, never skipped.
 const PINNED: [(&str, &str); 13] = [
     (
         "patch_nso.py",
-        "6ca3aeeda9cb608f2298926f546b7ab3488afba9dcd23ebcce0077fe2b84f009",
+        "d4ad73740f6c93b7708426c59d6d04421e962e94be0288a4b420152e29d10e38",
     ),
     (
         "nso.py",

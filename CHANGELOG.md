@@ -4,6 +4,11 @@ All notable changes are in this file. The format follows Keep a Changelog. Versi
 
 ## Unreleased
 
+### Fixed
+
+- The rewrite step follows the engine `f25fa956`. Before, `nxb build` stopped at the rewrite with exit code 1 for every game on that engine, because `patch_nso.py` differed from the pinned version (LNPANDY/NX2Apple#942). The three changes of `patch_nso.py` since `88c7e03f` were already ported (upstream `10fd9705`, `e49afb1e` and `9671a581`). Now the pin of `patch_nso.py` is the new hash.
+- The rules in `data/rewrite-rules` come from the engine `f25fa956` with the patches of NX2Apple, as before. They have the two new frame step sites of Hyrule Warriors: Age of Calamity (in-engine cutscenes at 30 frames a second under the 60 fps frame step, upstream `922679a1`) and the build rows of three new profiles.
+
 ### Changed
 
 - nxkit is licensed under GPL-3.0-only. Releases up to 0.9.2 stay under MIT. Code ported from Ryujinx and nxnative keeps its MIT notice in `THIRD_PARTY.md`.

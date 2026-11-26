@@ -4,6 +4,21 @@ All notable changes are in this file. The format follows Keep a Changelog. Versi
 
 ## Unreleased
 
+## 0.16.7 - 2026-11-26
+
+### Added
+
+- `msl-parse`, `msl-sema`, `air-emit`, `air-front`: support `texture2d_ms` reads and queries.
+- `nxb-split`: scan Blizzard CASC `.data`/BLTE archives and expand raw shader code-area matching.
+- `nxb-split`, `nxb-extract`, `nxb-build`, `nxkit-host`: filter Unreal Engine `.pak` archives and decode Oodle streams on standalone Mac builds via `nxkit-host oodle-serve`.
+- `nxb-rewrite`, `nxb-build`: support two-area `BACK_OFF`/`BACK_LEN` layouts and multi-hop ARM64 `b` relays for modules exceeding 128 MiB reach.
+
+### Fixed
+
+- `nxkit-host`: raise the `RLIMIT_NOFILE` soft limit at startup so `.app` bundles launched from Finder or a launcher do not exhaust the 256-descriptor default during parallel pipeline prewarm.
+- `nxb-extract`: support non-contiguous `NCZSECTN` layouts in NSZ/NCZ packages.
+- `nxb-build`: preserve `unsupported:` prefixes on shader translation/compilation errors (exit code 4) and exit with code 2 when the base game package is missing.
+
 ## 0.16.6 - 2026-11-26
 
 ### Fixed

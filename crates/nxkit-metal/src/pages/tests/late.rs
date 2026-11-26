@@ -255,9 +255,10 @@ fn a_snapshot_dropped_at_a_completion_is_counted_with_its_reason_and_the_next_ac
     let _t = TURN.lock().unwrap_or_else(PoisonError::into_inner);
     let (m, mir, pg) = late_page(0xA1, 0xA2);
     let mut st = Collect::default();
-    // Frame 600 is in another epoch than the read of the page (epoch 0): nobody read the page lately.
+    // Advance two epochs past the initial read (epoch 0): nobody read the page lately.
+    let later = crate::pages::EPOCH_FRAMES * 2 + 88;
     let _ = pg.flush_mirrored(2, &[], &[(m.addr(1) + 64, 128)], None, &mut st);
-    let _ = pg.flush_mirrored(600, &[], &[(m.addr(1) + 64, 128)], None, &mut st);
+    let _ = pg.flush_mirrored(later, &[], &[(m.addr(1) + 64, 128)], None, &mut st);
     let s0 = pg.stats();
     pg.complete(2);
     let s1 = pg.stats();
@@ -276,7 +277,7 @@ fn a_snapshot_dropped_at_a_completion_is_counted_with_its_reason_and_the_next_ac
         !reader.is_finished(),
         "no snapshot: the reader waits for the writer"
     );
-    pg.complete(600);
+    pg.complete(later);
     assert_eq!(reader.join().unwrap(), 0xB1);
     let s2 = pg.stats();
     assert_eq!(
@@ -329,8 +330,9 @@ fn a_readable_page_nobody_reads_lately_loses_its_access_at_the_completion() {
     pg.set_read_open(true);
     let mut st = Collect::default();
     let _ = pg.flush_mirrored(2, &[], &[(m.addr(1) + 64, 128)], None, &mut st);
-    // Frame 600 is in another epoch: when frame 2 completes, the page is not kept current any more.
-    let _ = pg.flush_mirrored(600, &[], &[(m.addr(1) + 64, 128)], None, &mut st);
+    // Advance two epochs: when frame 2 completes, the page is not kept current any more.
+    let later = crate::pages::EPOCH_FRAMES * 2 + 88;
+    let _ = pg.flush_mirrored(later, &[], &[(m.addr(1) + 64, 128)], None, &mut st);
     let s0 = pg.stats();
     pg.complete(2);
     let s1 = pg.stats();
@@ -345,7 +347,7 @@ fn a_readable_page_nobody_reads_lately_loses_its_access_at_the_completion() {
         !reader.is_finished(),
         "the page lost its read access: the reader waits"
     );
-    pg.complete(600);
+    pg.complete(later);
     reader.join().unwrap();
     done(pg);
     pg.set_read_open(false);

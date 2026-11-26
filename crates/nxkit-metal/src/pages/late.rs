@@ -246,12 +246,16 @@ pub(super) fn late_copy_back(
                     changed: [0; 4],
                     bytes: vec![0; p as usize],
                 });
-                for (d, &s) in lg.changed.iter_mut().zip(&changed_now) {
-                    *d |= s;
+                for (d, (&s, &mi)) in lg.changed.iter_mut().zip(changed_now.iter().zip(m.iter())) {
+                    *d = (*d & !mi) | s;
                 }
-                let save: Mask = std::array::from_fn(|k| copy[k] & lg.changed[k]);
-                if save.iter().any(|&x| x != 0) {
-                    copy_blocks(src, lg.bytes.as_mut_ptr() as u64, &save);
+                if lg.changed.iter().any(|&x| x != 0) {
+                    let save: Mask = std::array::from_fn(|k| copy[k] & lg.changed[k]);
+                    if save.iter().any(|&x| x != 0) {
+                        copy_blocks(src, lg.bytes.as_mut_ptr() as u64, &save);
+                    }
+                } else {
+                    last_gpu.remove(&pg);
                 }
             }
             let rem = still_stale_for(pg);
@@ -296,13 +300,24 @@ pub(super) fn stage_carry(
     };
     let mut skip = skip;
     let mut img: Option<Vec<u8>> = None;
-    let n = (bytes.len() as u64 / BLOCK) as usize;
+    let bs = BLOCK as usize;
+    let n = bytes.len() / bs;
     for b in (0..n).filter(|&b| has(&c.mask, b)) {
-        let r = b * BLOCK as usize..(b + 1) * BLOCK as usize;
-        if bytes[r.clone()] == c.frame[r.clone()] {
-            img.get_or_insert_with(|| bytes.to_vec())[r.clone()].copy_from_slice(&c.cpu[r]);
-            skip[b / 64] &= !(1 << (b % 64));
+        let base = b * bs;
+        let has_restorable = (0..bs).any(|j| {
+            let i = base + j;
+            bytes[i] == c.frame[i] && c.cpu[i] != c.frame[i]
+        });
+        if has_restorable {
+            let buf = img.get_or_insert_with(|| bytes.to_vec());
+            for j in 0..bs {
+                let i = base + j;
+                if bytes[i] == c.frame[i] {
+                    buf[i] = c.cpu[i];
+                }
+            }
         }
+        skip[b / 64] &= !(1 << (b % 64));
     }
     stager.stage_masked(pg, img.as_deref().unwrap_or(bytes), skip);
 }

@@ -115,41 +115,55 @@ impl Gpu {
         }
     }
 
+    fn check_pool_decl(&mut self, key: &str, vertex: bool) -> bool {
+        if key.is_empty() {
+            return false;
+        }
+        let map = &mut self.pool_decl[usize::from(vertex)];
+        match map.get(key) {
+            Some(has) => *has,
+            None => {
+                let has = self.programs.stage(key, vertex).is_ok_and(|p| {
+                    p.binds
+                        .iter()
+                        .any(|b| b.kind == crate::programs::BindKind::TexPool)
+                });
+                map.insert(key.to_owned(), has);
+                has
+            }
+        }
+    }
+
     /// True when a draw or dispatch of the frame runs a shader that has a `tex_pool` binding.
     fn frame_reads_pool(&mut self, detail: &FrameDetail) -> bool {
-        let mut checked: FastSet<(&str, bool)> = FastSet::default();
-        let mut keys: Vec<(&str, bool)> = Vec::new();
+        let mut checked_ptr: FastSet<(usize, bool)> = FastSet::default();
+        let mut prev_ptr = 0usize;
         for d in &detail.draws {
-            let p = &d.program;
-            keys.push((&p.vertex, true));
-            keys.extend(p.fragment.as_deref().map(|k| (k, false)));
-            keys.extend(p.task.as_deref().map(|k| (k, false)));
-            keys.extend(p.mesh.as_deref().map(|k| (k, false)));
-        }
-        keys.extend(
-            detail
-                .dispatches
-                .iter()
-                .map(|d| (d.program.as_str(), false)),
-        );
-        for (key, vertex) in keys {
-            if key.is_empty() || !checked.insert((key, vertex)) {
+            let ptr = Arc::as_ptr(d) as usize;
+            if ptr == prev_ptr {
                 continue;
             }
-            let map = &mut self.pool_decl[usize::from(vertex)];
-            let has = match map.get(key) {
-                Some(has) => *has,
-                None => {
-                    let has = self.programs.stage(key, vertex).is_ok_and(|p| {
-                        p.binds
-                            .iter()
-                            .any(|b| b.kind == crate::programs::BindKind::TexPool)
-                    });
-                    map.insert(key.to_owned(), has);
-                    has
+            prev_ptr = ptr;
+            let p = &d.program;
+            let stages = [
+                Some((&p.vertex, true)),
+                p.fragment.as_ref().map(|k| (k, false)),
+                p.task.as_ref().map(|k| (k, false)),
+                p.mesh.as_ref().map(|k| (k, false)),
+            ];
+            for (key, vertex) in stages.into_iter().flatten() {
+                if !key.is_empty()
+                    && checked_ptr.insert((Arc::as_ptr(key).cast::<u8>() as usize, vertex))
+                    && self.check_pool_decl(key, vertex)
+                {
+                    return true;
                 }
-            };
-            if has {
+            }
+        }
+        let mut checked_disp: FastSet<&str> = FastSet::default();
+        for d in &detail.dispatches {
+            let key = d.program.as_str();
+            if !key.is_empty() && checked_disp.insert(key) && self.check_pool_decl(key, false) {
                 return true;
             }
         }
@@ -238,10 +252,12 @@ impl Gpu {
     ) {
         let mut needed: FastSet<(u64, nxkit_metal::TextureKind)> = FastSet::default();
         needed.reserve(64);
-        // Cache whether a shader Arc key has any declared TextureKind views by pointer address, avoiding repeated
-        // string HashMap lookups across ~2,500 draws.
-        let mut decl_nonempty: FastMap<(usize, bool), bool> = FastMap::default();
-        decl_nonempty.reserve(128);
+        // Cache declared TextureKind views per shader Arc pointer so repeated draws avoid string lookups.
+        let mut decl_cache: FastMap<(usize, bool), Vec<(u32, nxkit_metal::TextureKind)>> =
+            FastMap::default();
+        decl_cache.reserve(128);
+        let fit_decl = &mut self.fit_decl;
+        let programs = &self.programs;
         let mut check_stage = |key: &str,
                                ptr: Option<usize>,
                                vertex: bool,
@@ -250,15 +266,14 @@ impl Gpu {
             if binds.is_empty() || key.is_empty() {
                 return;
             }
-            if let Some(p) = ptr {
-                let has = *decl_nonempty.entry((p, vertex)).or_insert_with(|| {
-                    !declared_views(&mut self.fit_decl, &self.programs, key, vertex).is_empty()
-                });
-                if !has {
-                    return;
-                }
-            }
-            for &(reg, k) in declared_views(&mut self.fit_decl, &self.programs, key, vertex) {
+            let views: &[(u32, nxkit_metal::TextureKind)] = if let Some(p) = ptr {
+                decl_cache
+                    .entry((p, vertex))
+                    .or_insert_with(|| declared_views(fit_decl, programs, key, vertex).to_vec())
+            } else {
+                declared_views(fit_decl, programs, key, vertex)
+            };
+            for &(reg, k) in views {
                 let Some(h) = binds
                     .iter()
                     .find(|t| t.stage == stage && t.slot == reg)

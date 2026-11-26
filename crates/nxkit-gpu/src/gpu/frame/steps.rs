@@ -99,6 +99,9 @@ impl Gpu {
             }
             if p.kind == PassKind::Render {
                 for a in plan.attachments_of(p) {
+                    if a.is_untouched() {
+                        continue;
+                    }
                     let Some((d, _)) = dirty.get_mut(&a.tex) else {
                         continue;
                     };

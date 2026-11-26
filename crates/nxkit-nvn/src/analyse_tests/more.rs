@@ -249,6 +249,47 @@ fn an_analyser_that_ran_before_gives_the_plan_of_a_fresh_one() {
 }
 
 #[test]
+fn an_untouched_attachment_gets_dont_care_and_preserves_liveness() {
+    let mut f = Fx::new();
+    let (a, unused, b, c) = (f.tex(RGBA8), f.tex(RGBA8), f.tex(RGBA8), f.tex(RGBA8));
+    // Pass 1 writes `unused`.
+    f.rec.set_render_targets(&[unused], None);
+    f.rec.draw(paint());
+    // Pass 2 binds `unused` on slot 1 without touching it (only slot 0 is written).
+    f.rec.set_render_targets(&[a, unused], None);
+    f.rec.draw(DrawState {
+        color_write: 0b01,
+        ..paint()
+    });
+    // Pass 3 samples `unused` into `b` and presents `b`, plus keeps `a` live via `c`.
+    f.rec.bind_texture(0, Some(unused));
+    f.rec.set_render_targets(&[b], None);
+    f.rec.draw(paint());
+    f.rec.bind_texture(0, Some(a));
+    f.rec.set_render_targets(&[c], None);
+    f.rec.draw(paint());
+    f.rec.present(b);
+    f.rec.present(c);
+    f.run().unwrap();
+
+    // Pass 1's `unused` stays Store because Pass 3 samples it through Pass 2.
+    let pass1_unused = &f.plan.attachments_of(&f.plan.passes[0])[0];
+    assert_eq!(pass1_unused.store, StoreAction::Store);
+
+    // Pass 2's untouched `unused` (slot 1) is DontCare/DontCare and excluded from byte totals.
+    let pass2_att = f.plan.attachments_of(&f.plan.passes[1]);
+    assert!(pass2_att[1].is_untouched());
+    assert_eq!(pass2_att[1].load, LoadAction::DontCare);
+    assert_eq!(pass2_att[1].store, StoreAction::DontCare);
+    assert!(!pass2_att[1].store_assumed);
+    assert!(!pass2_att[1].memoryless);
+    // The 4 touched color targets load without a clear, whereas the untouched 5th attachment adds 0 loaded bytes.
+    assert_eq!(f.plan.stats.bytes_loaded, 4 * COLOR_BYTES);
+    // 4 real touched color stores: `unused` (P1), `a` (P2), `b` (P3), `c` (P4).
+    assert_eq!(f.plan.stats.bytes_stored, 4 * COLOR_BYTES);
+}
+
+#[test]
 fn a_render_pass_with_only_a_discard_is_dropped() {
     let mut f = Fx::new();
     let (c, d) = (f.tex(RGBA8), f.tex(RGBA8));

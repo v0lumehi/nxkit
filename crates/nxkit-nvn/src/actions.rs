@@ -100,6 +100,13 @@ impl Actions {
             .count() as u32;
         for p in plan.passes.iter().rev() {
             for a in &mut plan.attachments[p.attachments.clone()] {
+                if a.is_untouched() {
+                    a.load = LoadAction::DontCare;
+                    a.store = StoreAction::DontCare;
+                    a.store_assumed = false;
+                    a.memoryless = false;
+                    continue;
+                }
                 let i = a.tex.0 as usize;
                 let after = self.live[i];
                 let after_ev = self.evidence[i];

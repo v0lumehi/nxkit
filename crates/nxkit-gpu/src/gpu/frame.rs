@@ -101,10 +101,15 @@ impl Gpu {
 
         // The batch comes first, so that the uniform snapshots go to its scratch memory on a helper thread while this
         // one resolves the textures. The chunks need both.
-        let mut ends = if plan.passes.is_empty() {
+        let weights = if plan.passes.is_empty() {
             Vec::new()
         } else {
-            jobs::split(&weights_of(plan), self.threads * CHUNKS_PER_THREAD)
+            weights_of(plan)
+        };
+        let mut ends = if weights.is_empty() {
+            Vec::new()
+        } else {
+            jobs::split(&weights, self.threads * CHUNKS_PER_THREAD)
         };
         // `NXKIT_PRIVATE=1`: the pages that game threads waited for lately as the results of this GPU are signalled when the
         // last pass that writes them is done. The frame is cut after those passes: each cut ends a command buffer, and the
@@ -135,7 +140,7 @@ impl Gpu {
         let stream = early.cuts.is_empty()
             && stream_enabled()
             && !crate::private::mirrored()
-            && lead_chunk(&weights_of(plan), &mut ends, max_buffers);
+            && lead_chunk(&weights, &mut ends, max_buffers);
         let t_ring = Instant::now();
         let mut batch = self.ring.begin(1 + ends.len())?;
         PHASES.with(|p| p.borrow_mut()[0] = nanos(t_ring, Instant::now()));
@@ -404,11 +409,14 @@ impl Gpu {
                 r
             })
             .collect();
-        let items: Vec<(usize, &mut CommandBuffer, Range<usize>)> = rest
+        let items: Vec<_> = rest
             .iter_mut()
             .zip(ranges)
             .enumerate()
-            .map(|(i, (cb, r))| (i + 1, cb, r))
+            .map(|(i, (cb, r))| {
+                let w: u64 = weights[r.clone()].iter().map(|w| u64::from(*w)).sum();
+                (w, (i + 1, cb, r))
+            })
             .collect();
         mark(t0, "pre-chunks");
         let t_chunks = Instant::now();
@@ -417,7 +425,7 @@ impl Gpu {
         if let Some(a) = &ahead {
             a.finish(0, first);
         }
-        let results = jobs::run_all(self.threads, items, |(index, cb, range)| {
+        let run_chunk_job = |(index, cb, range): (usize, &mut CommandBuffer, Range<usize>)| {
             let (start, cpu0) = (Instant::now(), nxkit_metal::thread::cpu_time_ns());
             let passes = range.len();
             let r = run_chunk(&sh, cb, &scratch, &keep, range);
@@ -433,7 +441,13 @@ impl Gpu {
                 passes,
             };
             (r, timing)
-        });
+        };
+        let results = if ahead.is_some() {
+            let plain = items.into_iter().map(|(_, item)| item).collect();
+            jobs::run_all(self.threads, plain, run_chunk_job)
+        } else {
+            jobs::run_all_prioritized(self.threads, items, run_chunk_job)
+        };
         let chunks_ns = nanos(t_chunks, Instant::now());
         let mut copied_back = Vec::new();
         let mut timings = Vec::with_capacity(results.len());

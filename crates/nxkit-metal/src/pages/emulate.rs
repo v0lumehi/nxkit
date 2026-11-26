@@ -124,6 +124,13 @@ pub(super) fn try_emulate(pg: usize, w: &AtomicU32, pc: u64, far: u64, uctx: *mu
             .eager
             .store(SHARED.epoch.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
     }
+    // Reject if a completion claimed any touched page into SYNC while decoding/checking.
+    for q in pa..=pb {
+        if word(q).is_none_or(|wq| wq.load(Ordering::Acquire) & STATE_MASK == SYNC) {
+            count_fallback(Reason::Mismatch, pc);
+            return false;
+        }
+    }
     // SAFETY: the alias maps the same pages as guest memory with read and write access, and `plan` lies inside the
     // pages `pa` and `pb`, which lie inside guest memory. The registers are the thread's own.
     unsafe {

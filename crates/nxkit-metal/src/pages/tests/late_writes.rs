@@ -541,3 +541,54 @@ fn a_cpu_reset_after_completion_on_rw_open_syncs_shadow_and_does_not_restage_res
     pg.set_adaptive(false, false);
     done(pg);
 }
+
+#[test]
+fn stage_carry_preserves_partial_cpu_write_in_same_block() {
+    let _t = TURN.lock().unwrap_or_else(PoisonError::into_inner);
+    let (m, mir, pg) = late_page(0x31, 0x32);
+    let written = [(m.addr(1) + 64, 64)];
+
+    // Teach page 1 as a late page via frame 2.
+    let _ = pg.flush_mirrored(2, &[], &written, None, &mut Collect::default());
+    let mut c2 = late_start(pg, &mir, 2);
+    late_end(&mut c2, &mir);
+    pg.complete(2);
+
+    // Frame 3 runs; while it runs, CPU writes two offsets inside block 1 (bytes 68 and 72).
+    let _ = pg.flush_mirrored(3, &[], &written, None, &mut Collect::default());
+    let mut c3 = late_start(pg, &mir, 3);
+    mir.store(1, 68, 0xAA);
+    mir.store(1, 72, 0xBB);
+    m.store(1, 68, 0x11);
+    m.store(1, 72, 0x22);
+    late_end(&mut c3, &mir);
+    // Completion of frame 3 sees GPU changed block 1, overwrites guest with frame 3's bytes and stashes carry.
+    pg.complete(3);
+    assert_eq!(m.load(1, 68), 0xAA);
+    assert_eq!(m.load(1, 72), 0xBB);
+
+    // Before frame 4 flushes, CPU modifies ONLY another offset in the same 64B block (byte 76), leaving 68/72 untouched.
+    m.store(1, 76, 0x33);
+    let mut st4 = Collect::default();
+    let _ = pg.flush_mirrored(4, &[], &written, None, &mut st4);
+    let idx = st4
+        .pages
+        .iter()
+        .position(|p| p.0 == 1)
+        .expect("page 1 staged");
+    assert_eq!(
+        st4.pages[idx].1[68], 0x11,
+        "earlier carried CPU byte restored"
+    );
+    assert_eq!(
+        st4.pages[idx].1[72], 0x22,
+        "earlier carried CPU byte restored"
+    );
+    assert_eq!(
+        st4.pages[idx].1[76], 0x33,
+        "newer partial CPU byte preserved"
+    );
+
+    pg.complete(4);
+    done(pg);
+}

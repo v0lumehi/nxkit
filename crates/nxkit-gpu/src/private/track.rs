@@ -114,11 +114,15 @@ pub(crate) fn note_rw(detail: &FrameDetail, programs: &Programs) {
         }
     };
     // Draws that share their programs bind the same slots: one look at each tuple of programs is enough.
+    let mut prev_ptr = 0usize;
     let mut seen = vec![(0usize, 0usize, 0usize, 0usize); 1024];
+    let mut seen_stage: crate::fastmap::FastSet<(usize, u32)> = crate::fastmap::FastSet::default();
     for d in &detail.draws {
-        if d.sbufs.is_empty() {
+        let draw_ptr = Arc::as_ptr(d) as usize;
+        if draw_ptr == prev_ptr || d.sbufs.is_empty() {
             continue;
         }
+        prev_ptr = draw_ptr;
         let v = Arc::as_ptr(&d.program.vertex).cast::<u8>() as usize;
         let f = d
             .program
@@ -142,30 +146,18 @@ pub(crate) fn note_rw(detail: &FrameDetail, programs: &Programs) {
         seen[at] = (v, f, t, m);
         for s in &d.sbufs {
             let slot_stage = s.slot | (s.stage as u32) << 24;
-            match s.stage {
-                Stage::Vertex => {
-                    let h = rw.hash_of(&d.program.vertex);
-                    learn(rw, h, &d.program.vertex, true, s.slot, slot_stage);
-                }
-                Stage::Fragment => {
-                    if let Some(k) = &d.program.fragment {
-                        let h = rw.hash_of(k);
-                        learn(rw, h, k, false, s.slot, slot_stage);
-                    }
-                }
-                Stage::Task => {
-                    if let Some(k) = &d.program.task {
-                        let h = rw.hash_of(k);
-                        learn(rw, h, k, false, s.slot, slot_stage);
-                    }
-                }
-                Stage::Mesh => {
-                    if let Some(k) = &d.program.mesh {
-                        let h = rw.hash_of(k);
-                        learn(rw, h, k, false, s.slot, slot_stage);
-                    }
-                }
-                _ => {}
+            let stage_key = match s.stage {
+                Stage::Vertex => Some((&d.program.vertex, true)),
+                Stage::Fragment => d.program.fragment.as_ref().map(|k| (k, false)),
+                Stage::Task => d.program.task.as_ref().map(|k| (k, false)),
+                Stage::Mesh => d.program.mesh.as_ref().map(|k| (k, false)),
+                _ => None,
+            };
+            if let Some((k, vertex)) = stage_key
+                && seen_stage.insert((Arc::as_ptr(k).cast::<u8>() as usize, slot_stage))
+            {
+                let h = rw.hash_of(k);
+                learn(rw, h, k, vertex, s.slot, slot_stage);
             }
         }
     }

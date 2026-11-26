@@ -31,6 +31,23 @@ fn worker<I, T>(
     }
 }
 
+fn run_ordered<I: Send, T: Send>(
+    threads: usize,
+    queue: VecDeque<(usize, I)>,
+    f: impl Fn(I) -> T + Sync,
+) -> Vec<T> {
+    let n = queue.len();
+    let queue = Mutex::new(queue);
+    let out: Mutex<Vec<Option<T>>> = Mutex::new((0..n).map(|_| None).collect());
+    let task = || worker(&queue, &out, &f);
+    nxkit_metal::thread::Pool::global().run(threads.min(n) - 1, &task);
+    out.into_inner()
+        .unwrap_or_else(PoisonError::into_inner)
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
 /// Runs `f` for each item on up to `threads` threads: the caller and threads of the process's encode pool
 /// (`nxkit_metal::thread::Pool`). The results come back in the order of the items.
 pub(crate) fn run_all<I: Send, T: Send>(
@@ -42,15 +59,28 @@ pub(crate) fn run_all<I: Send, T: Send>(
     if threads <= 1 || n <= 1 {
         return items.into_iter().map(f).collect();
     }
-    let queue = Mutex::new(items.into_iter().enumerate().collect::<VecDeque<_>>());
-    let out: Mutex<Vec<Option<T>>> = Mutex::new((0..n).map(|_| None).collect());
-    let task = || worker(&queue, &out, &f);
-    nxkit_metal::thread::Pool::global().run(threads.min(n) - 1, &task);
-    out.into_inner()
-        .unwrap_or_else(PoisonError::into_inner)
+    run_ordered(threads, items.into_iter().enumerate().collect(), f)
+}
+
+/// Runs `f` for each `(weight, item)` on up to `threads` threads, starting the heaviest items first so long tails do
+/// not sit behind small chunks. The results come back in the original order of `items`.
+pub(crate) fn run_all_prioritized<I: Send, T: Send>(
+    threads: usize,
+    items: Vec<(u64, I)>,
+    f: impl Fn(I) -> T + Sync,
+) -> Vec<T> {
+    let n = items.len();
+    if threads <= 1 || n <= 1 {
+        return items.into_iter().map(|(_, item)| f(item)).collect();
+    }
+    let mut indexed: Vec<(usize, u64, I)> = items
         .into_iter()
-        .flatten()
-        .collect()
+        .enumerate()
+        .map(|(i, (w, item))| (i, w, item))
+        .collect();
+    indexed.sort_by_key(|a| std::cmp::Reverse(a.1));
+    let queue = indexed.into_iter().map(|(i, _, item)| (i, item)).collect();
+    run_ordered(threads, queue, f)
 }
 
 /// Cuts `weights` (one per pass) into at most `parts` runs of neighbouring passes with similar total weight.
@@ -62,7 +92,16 @@ pub(crate) fn split(weights: &[u32], parts: usize) -> Vec<usize> {
     let mut ends = Vec::with_capacity(parts);
     let mut acc = 0u64;
     for (i, w) in weights.iter().enumerate() {
-        acc += u64::from(*w);
+        let w = u64::from(*w);
+        if acc > 0
+            && acc + w > target
+            && (acc + w - target) > target.saturating_sub(acc)
+            && ends.len() + 1 < parts
+        {
+            ends.push(i);
+            acc = 0;
+        }
+        acc += w;
         if acc >= target && ends.len() + 1 < parts {
             ends.push(i + 1);
             acc = 0;
@@ -100,5 +139,16 @@ mod tests {
         assert!(ends.windows(2).all(|w| w[0] < w[1]));
         assert!(ends.len() <= 3);
         assert_eq!(split(&[], 4), vec![0]);
+    }
+
+    #[test]
+    fn split_isolates_heavy_pass_in_its_own_chunk() {
+        let weights = [1, 1, 1, 100, 1, 1, 1];
+        let ends = split(&weights, 4);
+        assert_eq!(ends, vec![3, 4, 7]);
+        assert_eq!(
+            run_all_prioritized(4, vec![(1, 0), (100, 1), (5, 2), (50, 3)], |v| v + 10),
+            vec![10, 11, 12, 13]
+        );
     }
 }

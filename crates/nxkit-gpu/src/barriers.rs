@@ -278,6 +278,9 @@ pub(crate) fn touch(frame: &Frame, plan: &PassPlan, p: &Pass) -> Touch {
     };
     t.reads.extend_from_slice(&t.sampled);
     for a in plan.attachments_of(p) {
+        if a.is_untouched() {
+            continue;
+        }
         t.writes.push(a.tex);
         if a.loads_old() {
             t.reads.push(a.tex);
@@ -509,11 +512,19 @@ impl BarrierState {
                 h.write = Some(stages);
                 h.read = None;
             }
+            let read_stages = if p.kind == PassKind::Render
+                && !crate::knob("vsbar")
+                && !vertex_samples.get(index).copied().unwrap_or(true)
+            {
+                Stages::FRAGMENT
+            } else {
+                mine
+            };
             for id in &t.reads {
                 let id = aliases.get(id).unwrap_or(id);
                 let h = self.pending.entry(*id).or_default();
                 h.last = Some(index);
-                h.read = join(h.read, mine);
+                h.read = join(h.read, read_stages);
             }
             out.before.push(dep);
         }

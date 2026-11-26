@@ -194,8 +194,11 @@ pub(super) fn setup(sh: &EncodeCtx<'_>, pass: &Pass) -> Result<Setup, Skip> {
     let mut scale = 1.0;
     let mut has_stencil = false;
     let mut blocks = Vec::new();
-    for a in sh.plan.attachments_of(pass) {
-        if matches!(a.slot, Slot::Color(n) if selected & (1 << n) == 0) {
+    let has_touched = attachments.iter().any(|a| !a.is_untouched());
+    for a in attachments {
+        if matches!(a.slot, Slot::Color(n) if selected & (1 << n) == 0)
+            || (has_touched && a.is_untouched())
+        {
             continue;
         }
         let res = sh.textures.get(&a.tex).ok_or(Skip::Texture)?;

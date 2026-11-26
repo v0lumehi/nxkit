@@ -279,7 +279,7 @@ fn pack(state: u32, frame: u64) -> u32 {
 }
 
 /// Flushes per epoch of the eager copy: a page that game threads stop faulting on loses its place after two epochs.
-const EPOCH_FRAMES: u64 = 256;
+pub(crate) const EPOCH_FRAMES: u64 = 2048;
 /// Consecutive flushes in which the CPU dirtied a page before it stays writable.
 const HOT_AFTER: u8 = 3;
 /// Consecutive flushes in which a writable page did not change before it is protected again.

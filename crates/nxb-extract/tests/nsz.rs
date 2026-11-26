@@ -257,13 +257,27 @@ fn hostile_ncz_files_are_refused() {
         (sec + 8, u64::MAX),
         (sec + 8, 0),
         (sec + 8, 1 << 21),
-        (sec + 16, 0x4001),
+        (sec + 16, 0x3fff),
         (sec + 24, u64::MAX),
         (sec + 24, 1 << 50),
     ] {
         let mut b = solid.clone();
         b[at..at + 8].copy_from_slice(&v.to_le_bytes());
         assert!(open(b).is_err(), "{at:#x} = {v:#x}");
+    }
+    // overlapping sections are refused even if both start at or after 0x4000
+    {
+        let mut b = vec![0u8; 0x4000];
+        b.extend_from_slice(b"NCZSECTN");
+        b.extend_from_slice(&2u64.to_le_bytes());
+        for (start, len) in [(0x4000u64, 0x2000u64), (0x5000, 0x2000)] {
+            b.extend_from_slice(&start.to_le_bytes());
+            b.extend_from_slice(&len.to_le_bytes());
+            b.extend_from_slice(&0u64.to_le_bytes());
+            b.extend_from_slice(&[0u8; 0x28]);
+        }
+        b.extend_from_slice(&zstd(&vec![0u8; 0x4000]));
+        assert!(open(b).is_err());
     }
     // block header: block size exponent, count and total size that do not match, a compressed size past the block
     let bh = sec + 16 + 0x40 * plain.len();
@@ -292,4 +306,91 @@ fn hostile_ncz_files_are_refused() {
     let mut shorter = solid.clone();
     shorter[last..last + 8].copy_from_slice(&(n - 0x200).to_le_bytes());
     assert!(open(shorter).unwrap().read_vec(0x4000, 16).is_err());
+}
+
+#[test]
+fn non_contiguous_ncz_sections_roundtrip() {
+    let mut header = vec![0u8; 0x4000];
+    header[0x200..0x204].copy_from_slice(b"NCA3");
+    let key = [0x3cu8; 16];
+    let p0 = [1u8, 2, 3, 4, 5, 6, 7, 8];
+    let p1 = [8u8, 7, 6, 5, 4, 3, 2, 1];
+    let sec0: Vec<u8> = (0..0x2000usize).map(|i| (i * 7 + 3) as u8).collect();
+    let sec1: Vec<u8> = (0..0x4000usize).map(|i| (i * 13 + 9) as u8).collect();
+    // Leading gap 0x4000..0x8000 and middle gap 0xa000..0xe000.
+    let mut expected = header.clone();
+    expected.resize(0x12000, 0);
+    expected[0x8000..0xa000].copy_from_slice(&sec0);
+    Aes128::new(&key).ctr(p0, 0x8000, &mut expected[0x8000..0xa000]);
+    expected[0xe000..0x12000].copy_from_slice(&sec1);
+    Aes128::new(&key).ctr(p1, 0xe000, &mut expected[0xe000..0x12000]);
+
+    let build_table = || {
+        let mut v = header.clone();
+        v.extend_from_slice(b"NCZSECTN");
+        v.extend_from_slice(&2u64.to_le_bytes());
+        for (off, data, prefix) in [(0x8000u64, &sec0, p0), (0xe000u64, &sec1, p1)] {
+            v.extend_from_slice(&off.to_le_bytes());
+            v.extend_from_slice(&(data.len() as u64).to_le_bytes());
+            v.extend_from_slice(&3u64.to_le_bytes());
+            v.extend_from_slice(&0u64.to_le_bytes());
+            v.extend_from_slice(&key);
+            v.extend_from_slice(&prefix);
+            v.extend_from_slice(&[0u8; 8]);
+        }
+        v
+    };
+    let build_blocks = |v: &mut Vec<u8>, body: &[u8]| {
+        let exp = 12u32;
+        let blocks: Vec<Vec<u8>> = body
+            .chunks(1usize << exp)
+            .map(|b| {
+                let z = zstd(b);
+                if z.len() >= b.len() { b.to_vec() } else { z }
+            })
+            .collect();
+        v.extend_from_slice(b"NCZBLOCK");
+        v.extend_from_slice(&[2, 1, 0, exp as u8]);
+        v.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
+        v.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        for b in &blocks {
+            v.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        }
+        for b in &blocks {
+            v.extend_from_slice(b);
+        }
+    };
+
+    let mut packed_body = sec0.clone();
+    packed_body.extend_from_slice(&sec1);
+    let mut flat_body = vec![0u8; 0x12000 - 0x4000];
+    flat_body[0x4000..0x6000].copy_from_slice(&sec0);
+    flat_body[0xa000..0xe000].copy_from_slice(&sec1);
+
+    let mut packed_solid = build_table();
+    packed_solid.extend_from_slice(&zstd(&packed_body));
+    let mut packed_block = build_table();
+    build_blocks(&mut packed_block, &packed_body);
+    let mut flat_block = build_table();
+    build_blocks(&mut flat_block, &flat_body);
+
+    for (label, bytes) in [
+        ("packed-solid", packed_solid),
+        ("packed-block", packed_block),
+        ("flat-block", flat_block),
+    ] {
+        let s = open(bytes).unwrap();
+        assert_eq!(s.size(), expected.len() as u64, "{label}");
+        let mut all = vec![0u8; expected.len()];
+        s.read_at(0, &mut all).unwrap();
+        assert!(all == expected, "{label}: whole NCA mismatch");
+        for (at, len) in [(0x3ff0u64, 0x200usize), (0x9f00, 0x300), (0xdf00, 0x300)] {
+            let mut slice = vec![0u8; len];
+            s.read_at(at, &mut slice).unwrap();
+            assert!(
+                slice == expected[at as usize..at as usize + len],
+                "{label}: {at:#x}+{len:#x}"
+            );
+        }
+    }
 }

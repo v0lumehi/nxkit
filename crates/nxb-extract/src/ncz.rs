@@ -55,15 +55,25 @@ fn le64(b: &[u8], o: usize) -> u64 {
 struct Sec {
     start: u64,
     end: u64,
+    stream_off: u64,
     ctr: bool,
     key: [u8; 16],
     prefix: [u8; 8],
+}
+
+#[derive(Clone)]
+struct SolidDecoded {
+    storage: Arc<dyn Storage>,
+    packed: bool,
+    encrypted: bool,
 }
 
 enum Body {
     Blocks {
         src: Arc<dyn Storage>,
         shift: u32,
+        total: u64,
+        packed: bool,
         /// Start of each block in `src`, then the end of the last.
         at: Vec<u64>,
         cache: Mutex<VecDeque<(u64, Arc<Vec<u8>>)>>,
@@ -71,7 +81,8 @@ enum Body {
     Solid {
         src: Arc<dyn Storage>,
         at: u64,
-        decoded: Mutex<Option<Arc<dyn Storage>>>,
+        stream_sum: u64,
+        decoded: Mutex<Option<SolidDecoded>>,
     },
 }
 
@@ -104,15 +115,17 @@ impl NczStorage {
             .read_vec(HEADER + 16, (count * 0x40) as usize)
             .map_err(|_| bad(id, "section table past the end"))?;
         let mut secs: Vec<Sec> = Vec::with_capacity(count as usize);
-        let mut at = HEADER;
+        let mut stream_sum = 0u64;
         for e in table.chunks(0x40) {
             let (off, size, kind) = (le64(e, 0), le64(e, 8), le64(e, 16));
-            if off != at {
-                return Err(ExtractError::Unsupported(format!(
-                    "{id}.ncz: sections that do not follow each other from 0x4000"
-                )));
+            if off < HEADER {
+                return Err(bad(id, format!("section offset {off:#x} before 0x4000")));
             }
             let end = off
+                .checked_add(size)
+                .filter(|&x| x <= MAX_NCA)
+                .ok_or_else(|| bad(id, "section size"))?;
+            let next_stream = stream_sum
                 .checked_add(size)
                 .filter(|&x| x <= MAX_NCA)
                 .ok_or_else(|| bad(id, "section size"))?;
@@ -122,13 +135,19 @@ impl NczStorage {
             secs.push(Sec {
                 start: off,
                 end,
+                stream_off: stream_sum,
                 ctr: kind == 3 || kind == 4,
                 key,
                 prefix,
             });
-            at = end;
+            stream_sum = next_stream;
         }
-        let size = at;
+        secs.sort_by_key(|s| (s.start, s.end));
+        if secs.windows(2).any(|w| w[1].start < w[0].end) {
+            return Err(bad(id, "overlapping sections"));
+        }
+        let size = secs.last().map_or(HEADER, |s| s.end);
+        let span_len = size - HEADER;
         let p = HEADER + 16 + count * 0x40;
         let magic = src.read_vec(p, 8).unwrap_or_default();
         let body = if magic == b"NCZBLOCK" {
@@ -146,7 +165,14 @@ impl NczStorage {
                     h[8]
                 )));
             }
-            if h[9] != 1 || total != size - HEADER || nblocks != total.div_ceil(1 << exp) {
+            let packed = if total == span_len {
+                false
+            } else if total == stream_sum {
+                true
+            } else {
+                return Err(bad(id, "block header does not match the section table"));
+            };
+            if h[9] != 1 || nblocks != total.div_ceil(1 << exp) {
                 return Err(bad(id, "block header does not match the section table"));
             }
             let sizes = src
@@ -169,6 +195,8 @@ impl NczStorage {
             Body::Blocks {
                 src,
                 shift: u32::from(exp),
+                total,
+                packed,
                 at,
                 cache: Mutex::new(VecDeque::new()),
             }
@@ -176,6 +204,7 @@ impl NczStorage {
             Body::Solid {
                 src,
                 at: p,
+                stream_sum,
                 decoded: Mutex::new(None),
             }
         };
@@ -209,8 +238,10 @@ impl NczStorage {
         let Body::Blocks {
             src,
             shift,
+            total,
             at,
             cache,
+            ..
         } = &self.body
         else {
             return Err(bad(&self.id, "not block compressed"));
@@ -220,7 +251,6 @@ impl NczStorage {
         {
             return Ok(b.1.clone());
         }
-        let total = self.size - HEADER;
         let want = (1u64 << shift).min(total - i * (1 << shift));
         let raw = src.read_vec(
             at[i as usize],
@@ -248,9 +278,16 @@ impl NczStorage {
         Ok(b)
     }
 
-    /// Decodes the solid stream once, the result holds the NCA's bytes from 0x4000 on, encrypted again.
-    fn solid(&self) -> Result<Arc<dyn Storage>> {
-        let Body::Solid { src, at, decoded } = &self.body else {
+    /// Decodes the solid stream once. Contiguous streams are cached already CTR-encrypted; non-contiguous streams keep
+    /// plaintext so [`Self::read_at`] can zero-fill gaps and encrypt at true NCA offsets.
+    fn solid(&self) -> Result<SolidDecoded> {
+        let Body::Solid {
+            src,
+            at,
+            stream_sum,
+            decoded,
+        } = &self.body
+        else {
             return Err(bad(&self.id, "not a solid stream"));
         };
         let mut g = decoded
@@ -259,7 +296,8 @@ impl NczStorage {
         if let Some(d) = g.as_ref() {
             return Ok(d.clone());
         }
-        let total = self.size - HEADER;
+        let span_len = self.size - HEADER;
+        let contiguous = *stream_sum == span_len;
         let mut pos = *at;
         let n = src.size();
         // read ahead in 8 MiB pieces: the decoder asks for a few bytes at a time
@@ -286,7 +324,7 @@ impl NczStorage {
             Ok(())
         };
         let (mut mem, mut file) = (Vec::new(), None);
-        if total > SPILL_MEM {
+        if span_len > SPILL_MEM {
             let dir = SPILL_DIR
                 .lock()
                 .ok()
@@ -304,13 +342,15 @@ impl NczStorage {
                 .open(&path)
                 .map_err(|e| ExtractError::io(format!("create {}", path.display()), e))?;
             let _ = std::fs::remove_file(&path); // unlinked at once: nothing is left behind after a crash
-            file = Some(FileStorage::from_file(f, total, "decoded NCZ"));
+            file = Some(FileStorage::from_file(f, span_len, "decoded NCZ"));
         }
         let mut written = 0u64;
         let mut failure = None;
         let mut sink = |b: &[u8]| -> std::result::Result<(), nxb_split::SplitError> {
             let mut v = b.to_vec();
-            self.encrypt(HEADER + written, &mut v);
+            if contiguous {
+                self.encrypt(HEADER + written, &mut v);
+            }
             match &file {
                 Some(f) => f
                     .write_at(written, &v)
@@ -320,25 +360,75 @@ impl NczStorage {
             written += v.len() as u64;
             Ok(())
         };
-        let r = nxb_split::zstd::decompress_stream(&mut input, n - at, total, &mut sink);
+        let r = nxb_split::zstd::decompress_stream(&mut input, n - at, span_len, &mut sink);
         if let Err(e) = r {
             failure = Some(e);
         }
         if let Some(e) = failure {
             return Err(bad(&self.id, format!("solid stream: {e}")));
         }
-        if written != total {
+        let packed = if contiguous {
+            if written != span_len {
+                return Err(bad(
+                    &self.id,
+                    format!("solid stream decodes to {written} bytes, not {span_len}"),
+                ));
+            }
+            false
+        } else if written == *stream_sum {
+            true
+        } else if written == span_len {
+            false
+        } else {
             return Err(bad(
                 &self.id,
-                format!("solid stream decodes to {written} bytes, not {total}"),
+                format!("solid stream decodes to {written} bytes, not {stream_sum} or {span_len}"),
             ));
-        }
-        let s: Arc<dyn Storage> = match file {
+        };
+        let storage: Arc<dyn Storage> = match file {
             Some(f) => Arc::new(f),
             None => Arc::new(MemStorage(mem)),
         };
-        *g = Some(s.clone());
-        Ok(s)
+        let res = SolidDecoded {
+            storage,
+            packed,
+            encrypted: contiguous,
+        };
+        *g = Some(res.clone());
+        Ok(res)
+    }
+
+    fn read_blocks_range(&self, shift: u32, stream_off: u64, out: &mut [u8]) -> Result<()> {
+        let mut pos = 0usize;
+        while pos < out.len() {
+            let s = stream_off + pos as u64;
+            let b = self.block(s >> shift)?;
+            let within = (s & ((1 << shift) - 1)) as usize;
+            let n = (b.len() - within).min(out.len() - pos);
+            out[pos..pos + n].copy_from_slice(&b[within..within + n]);
+            pos += n;
+        }
+        Ok(())
+    }
+
+    fn read_packed(
+        &self,
+        from: u64,
+        rest: &mut [u8],
+        mut read_stream: impl FnMut(u64, &mut [u8]) -> Result<()>,
+    ) -> Result<()> {
+        rest.fill(0);
+        let end = from + rest.len() as u64;
+        let mut i = self.secs.partition_point(|s| s.end <= from);
+        while let Some(s) = self.secs.get(i).filter(|s| s.start < end) {
+            let (a, b) = (s.start.max(from), s.end.min(end));
+            if a < b {
+                let off = s.stream_off + (a - s.start);
+                read_stream(off, &mut rest[(a - from) as usize..(b - from) as usize])?;
+            }
+            i += 1;
+        }
+        Ok(())
     }
 }
 
@@ -366,16 +456,25 @@ impl Storage for NczStorage {
         }
         let (from, rest) = (offset + head as u64, &mut buf[head..]);
         match &self.body {
-            Body::Solid { .. } => self.solid()?.read_at(from - HEADER, rest),
-            Body::Blocks { shift, .. } => {
-                let mut pos = 0usize;
-                while pos < rest.len() {
-                    let s = from - HEADER + pos as u64;
-                    let b = self.block(s >> shift)?;
-                    let within = (s & ((1 << shift) - 1)) as usize;
-                    let n = (b.len() - within).min(rest.len() - pos);
-                    rest[pos..pos + n].copy_from_slice(&b[within..within + n]);
-                    pos += n;
+            Body::Solid { .. } => {
+                let s = self.solid()?;
+                if s.packed {
+                    self.read_packed(from, rest, |off, dst| s.storage.read_at(off, dst))?;
+                } else {
+                    s.storage.read_at(from - HEADER, rest)?;
+                }
+                if !s.encrypted {
+                    self.encrypt(from, rest);
+                }
+                Ok(())
+            }
+            Body::Blocks { shift, packed, .. } => {
+                if *packed {
+                    self.read_packed(from, rest, |off, dst| {
+                        self.read_blocks_range(*shift, off, dst)
+                    })?;
+                } else {
+                    self.read_blocks_range(*shift, from - HEADER, rest)?;
                 }
                 self.encrypt(from, rest);
                 Ok(())

@@ -353,6 +353,26 @@ fn prepare_jobs(output: records::Outputs, notes: &mut Vec<String>) -> Result<Pre
     })
 }
 
+fn has_unsupported(s: &str) -> bool {
+    s.starts_with("unsupported") || s.contains("unsupported:")
+}
+
+fn format_translate_err(key: &str, reason: &str, detail: &str) -> String {
+    if has_unsupported(reason) || has_unsupported(detail) {
+        format!("unsupported: shader {key}: {reason}: {detail}")
+    } else {
+        format!("shader {key}: {reason}: {detail}")
+    }
+}
+
+fn format_compile_err(key: &str, suffix: &str, err: &str) -> String {
+    if has_unsupported(err) {
+        format!("unsupported: shader {key}{suffix} compilation: {err}")
+    } else {
+        format!("shader {key}{suffix} compilation: {err:?}")
+    }
+}
+
 fn compile_work(
     entry: &Work,
     chain: &str,
@@ -374,12 +394,12 @@ fn compile_work(
         ..Default::default()
     };
     let translated = msl::translate(&entry.job, &entry.code, &ctx)
-        .map_err(|e| format!("shader {key}: {}: {}", e.reason, e.detail))?;
+        .map_err(|e| format_translate_err(key, &e.reason, &e.detail))?;
     let mut files = Vec::new();
     for lib in translated.libraries {
         let stem = format!("shaders/{key}{}", lib.suffix);
         let mut metallib = compile_raw(lib.msl.as_bytes(), ios)
-            .map_err(|e| format!("shader {key}{} compilation: {e:?}", lib.suffix))?;
+            .map_err(|e| format_compile_err(key, &lib.suffix, &e))?;
         if lib.suffix == "_b"
             && let Some(side) = &translated.side
         {

@@ -180,3 +180,24 @@ fn discover_dir_writes_tables_to_out_dir() {
     assert!(out.join("shaders/pso_pairs.tsv").is_file());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn unsupported_shader_errors_preserve_unsupported_prefix() {
+    let msg = format_compile_err(
+        "17b082dfef30eba9",
+        "_b",
+        "front end rejected: unsupported:rejected:texture-kind:texture2d_ms",
+    );
+    assert!(msg.starts_with("unsupported: "), "{msg}");
+    let normal = format_compile_err("17b082dfef30eba9", "_b", "syntax error");
+    assert!(!normal.starts_with("unsupported:"), "{normal}");
+    let tx = format_translate_err("abcd", "unsupported", "missing opcode");
+    assert!(tx.starts_with("unsupported: "), "{tx}");
+    #[cfg(feature = "air-front")]
+    {
+        let msl = b"#include <metal_stdlib>\nusing namespace metal;\nfragment float4 main0(texture1d<float> t [[texture(0)]]) { return t.read(0u); }\n";
+        let err = compile_raw(msl, false).unwrap_err();
+        let formatted = format_compile_err("ms_test", "_b", &err);
+        assert!(formatted.starts_with("unsupported: "), "{formatted}");
+    }
+}

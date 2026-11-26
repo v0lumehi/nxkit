@@ -351,9 +351,12 @@ fn scan_packages(
     let app = want.unwrap_or_else(|| fams.keys().next().copied().unwrap_or(0));
     let fam = fams.remove(&app).unwrap_or_default();
     let base = fam.base.ok_or_else(|| {
-        format!(
-            "no base game package found in {} (title ID {app:016X})",
-            dir.display()
+        crate::exit::fail(
+            2,
+            format!(
+                "no base game package found in {} (title ID {app:016X}); put the base game package in the same folder",
+                dir.display()
+            ),
         )
     })?;
     // one DLC in several copies: the highest version, then the largest file

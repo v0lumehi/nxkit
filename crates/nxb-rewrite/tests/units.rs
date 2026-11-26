@@ -65,7 +65,7 @@ fn make_nso(
     nso[0x40..0x50].copy_from_slice(&[0xab; 0x10]);
 
     let img = &mut nso[0x100..];
-    for chunk in img[..text_size].chunks_exact_mut(4) {
+    for chunk in img[..text_size].as_chunks_mut::<4>().0 {
         chunk.copy_from_slice(&gap_word.to_le_bytes());
     }
     for (off, words) in funcs {
@@ -76,7 +76,9 @@ fn make_nso(
 
     // Place MOD0, CIE, FDEs, and .eh_frame_hdr inside .rodata.
     let mod0 = ro_off;
-    put32(img, 0, encode::b(0, 0x40).unwrap());
+    if let Ok(b0) = encode::b(0, 0x40) {
+        put32(img, 0, b0);
+    }
     put32(img, 4, mod0 as u32);
     img[mod0..mod0 + 4].copy_from_slice(b"MOD0");
     let eh_hdr = ro_off + 0x100;
@@ -148,20 +150,20 @@ fn read_va(
     back_off: i64,
     back_len: usize,
     va: i64,
-) -> u32 {
+) -> Result<u32, String> {
     if va >= 0 && (va as usize) < file_image_len {
-        return get32(bin, va as usize);
+        return Ok(get32(bin, va as usize));
     }
     let front_len = bin.len() - file_image_len - back_len;
     if va >= patch_off && va < patch_off + front_len as i64 {
         let off = file_image_len + (va - patch_off) as usize;
-        return get32(bin, off);
+        return Ok(get32(bin, off));
     }
     if va >= back_off && va < back_off + back_len as i64 {
         let off = bin.len() - back_len + (va - back_off) as usize;
-        return get32(bin, off);
+        return Ok(get32(bin, off));
     }
-    panic!("va {va:#x} outside mapped executable ranges");
+    Err(format!("va {va:#x} outside mapped executable ranges"))
 }
 
 fn follow_to_stub(
@@ -171,17 +173,19 @@ fn follow_to_stub(
     back_off: i64,
     back_len: usize,
     start: i64,
-) -> (i64, usize) {
+) -> Result<(i64, usize), String> {
     let mut pc = start;
     let mut hops = 0usize;
     loop {
         if pc < 0 || pc >= back_off {
-            return (pc, hops);
+            return Ok((pc, hops));
         }
-        let w = read_va(bin, patch_off, file_image_len, back_off, back_len, pc);
-        let ins = decode(w, pc as u64).expect("valid instruction");
+        let w = read_va(bin, patch_off, file_image_len, back_off, back_len, pc)?;
+        let ins = decode(w, pc as u64).ok_or_else(|| format!("invalid insn at {pc:#x}"))?;
         assert_eq!(ins.mn, "b", "expected branch at {pc:#x} ({})", ins.mn);
-        let tgt = ins.target().unwrap() as i64;
+        let tgt = ins
+            .target()
+            .ok_or_else(|| format!("no target at {pc:#x}"))? as i64;
         let disp = tgt - pc;
         assert!((-(1 << 27)..(1 << 27)).contains(&disp));
         pc = tgt;
@@ -198,21 +202,23 @@ fn follow_to_addr(
     back_len: usize,
     start: i64,
     want: i64,
-) -> usize {
+) -> Result<usize, String> {
     let mut pc = start;
     let mut hops = 0usize;
     loop {
         if pc == want {
-            return hops;
+            return Ok(hops);
         }
-        let w = read_va(bin, patch_off, file_image_len, back_off, back_len, pc);
-        let ins = decode(w, pc as u64).expect("valid instruction");
+        let w = read_va(bin, patch_off, file_image_len, back_off, back_len, pc)?;
+        let ins = decode(w, pc as u64).ok_or_else(|| format!("invalid insn at {pc:#x}"))?;
         assert_eq!(
             ins.mn, "b",
             "expected return branch at {pc:#x} ({})",
             ins.mn
         );
-        let tgt = ins.target().unwrap() as i64;
+        let tgt = ins
+            .target()
+            .ok_or_else(|| format!("no target at {pc:#x}"))? as i64;
         let disp = tgt - pc;
         assert!((-(1 << 27)..(1 << 27)).contains(&disp));
         pc = tgt;
@@ -292,7 +298,8 @@ fn large_module_with_dead_zone_uses_multi_hop_relays_and_back_area() {
             back_off,
             back_len,
             site as i64,
-        );
+        )
+        .unwrap();
         if site == site_front {
             assert!(stub < 0);
             assert_eq!(hops, 1);
@@ -313,7 +320,8 @@ fn large_module_with_dead_zone_uses_multi_hop_relays_and_back_area() {
             back_len,
             stub + tail_off,
             site as i64 + 4,
-        );
+        )
+        .unwrap();
         if site == site_mid1 || site == site_mid2 {
             assert!(ret_hops >= 2, "return from {site:#x} should also relay");
         }

@@ -135,6 +135,8 @@ fn layout(nso: &[u8], opts: &Options, front_env: Option<u64>) -> R<Layout> {
         caves: None,
         cave_data_blocks: Vec::new(),
         cave_excluded: HashSet::new(),
+        cave_fdes: Vec::new(),
+        cave_code_ranges: Vec::new(),
         gates: Vec::new(),
         nfix: 0,
         stats: Vec::new(),
@@ -260,6 +262,8 @@ fn run_inner(
         }
         rw.cave_data_blocks = scan.data_blocks.clone();
         rw.cave_excluded = excl;
+        rw.cave_fdes = crate::scan::fde_ranges(&rw.img)?;
+        rw.cave_code_ranges = crate::scan::code_ranges(&scan.data_blocks, rw.text_end);
     }
     // rewrite the sites
     for w in &windows {

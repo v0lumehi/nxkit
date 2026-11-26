@@ -387,6 +387,8 @@ mod tests {
             caves: Some(CaveMap::default()),
             cave_data_blocks: Vec::new(),
             cave_excluded: HashSet::new(),
+            cave_fdes: Vec::new(),
+            cave_code_ranges: Vec::new(),
             gates: Vec::new(),
             nfix: 0,
             stats: Vec::new(),
@@ -408,10 +410,12 @@ mod tests {
         // Decode emitted words before padbase and confirm movz + movk + add x16, x16, x17 + br x16.
         let mnemonics: Vec<&str> = rw
             .front_area
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .take(15)
             .filter_map(|c| {
-                let w = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                let w = u32::from_le_bytes(*c);
                 dis(w, st).ok().map(|i| i.mn)
             })
             .collect();

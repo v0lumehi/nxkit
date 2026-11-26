@@ -1,4 +1,4 @@
-//! Loose `romfs/` folder support for [`crate::split::split`] (used when a NUP's deferred split runs later).
+//! Loose `romfs/` folder support for [`super::split`] (used when a NUP's deferred split runs later).
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -10,10 +10,10 @@ use nxb_split::SplitError;
 use nxb_split::records::Outputs;
 use nxb_split::src::Src;
 
+use super::{SplitRequest, Templates, VersionIn};
 use crate::error::{ExtractError, Result};
 use crate::fileext::FileExt;
 use crate::post::{PostFile, stream_digest};
-use crate::split::{SplitRequest, Templates, VersionIn};
 
 struct LooseSrc {
     path: PathBuf,

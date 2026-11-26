@@ -19,6 +19,7 @@ use nxb_model::{Digest, sha256};
 use crate::error::{ExtractError, Result};
 use crate::split_out::write_outputs;
 
+mod dir;
 pub use crate::listing::{ImageFile, image_files};
 
 /// Where the split writes.
@@ -388,7 +389,7 @@ pub fn split(req: &SplitRequest) -> Result<(Outputs, Vec<String>)> {
             .iter()
             .all(|v| !v.join("RomFS.img").is_file() && v.join("romfs").is_dir())
     {
-        return crate::split_dir::split_loose(req);
+        return dir::split_loose(req);
     }
     let mut t = Templates::new(&req.game_tsv)?;
     let mut versions = Vec::new();

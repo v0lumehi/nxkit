@@ -3,7 +3,6 @@
 use std::collections::{BTreeMap, HashSet};
 
 use crate::error::RewriteError;
-use crate::scan::{code_ranges, fde_ranges};
 
 /// Maximum backward byte displacement of ARM64 `b` (`-128 MiB`).
 pub(crate) const B_REACH_BACK: i64 = 1 << 27;
@@ -60,20 +59,35 @@ pub(crate) struct CaveMap {
     free: BTreeMap<i64, i64>,
 }
 
+/// Inputs for scanning unused executable caves in `[0, data_off_page)`.
+pub(crate) struct CaveInput<'a> {
+    pub(crate) img: &'a [u8],
+    pub(crate) text_end: i64,
+    pub(crate) ro_off: usize,
+    pub(crate) data_off: usize,
+    pub(crate) data_blocks: &'a [(i64, i64)],
+    pub(crate) excluded: &'a HashSet<i64>,
+    pub(crate) fdes: &'a [(i64, i64)],
+    pub(crate) code_ranges: &'a [(i64, i64)],
+}
+
 impl CaveMap {
     /// Collects safe unused executable padding in `[0, data_off_page)`:
     /// 1. The inter-segment gap `[text_end, ro_off)` when `ro_off > text_end`.
     /// 2. Alignment padding (`nop`, `brk #0/#1`, `0`) in inter-FDE gaps of `.text` that follow a
     ///    function terminator/call, lie outside `data_blocks`, are not in `excluded`, and are not
     ///    targeted by any branch, `adr`, or PC-relative literal load.
-    pub(crate) fn build(
-        img: &[u8],
-        text_end: i64,
-        ro_off: usize,
-        data_off: usize,
-        data_blocks: &[(i64, i64)],
-        excluded: &HashSet<i64>,
-    ) -> Result<CaveMap, RewriteError> {
+    pub(crate) fn build(input: &CaveInput<'_>) -> CaveMap {
+        let CaveInput {
+            img,
+            text_end,
+            ro_off,
+            data_off,
+            data_blocks,
+            excluded,
+            fdes: raw_fdes,
+            code_ranges,
+        } = *input;
         let mut map = CaveMap::default();
         let text_limit = if data_off > 0 {
             (data_off as i64 / 0x4000) * 0x4000
@@ -93,12 +107,11 @@ impl CaveMap {
         }
 
         // 2. Inter-FDE padding gaps inside .text.
-        let raw_fdes = fde_ranges(img)?;
         if raw_fdes.is_empty() {
-            return Ok(map);
+            return map;
         }
         let mut fdes: Vec<(i64, i64)> = Vec::new();
-        for (s, e) in raw_fdes {
+        for &(s, e) in raw_fdes {
             let (s, e) = (s.max(0), e.min(text_end));
             if s >= e {
                 continue;
@@ -109,10 +122,10 @@ impl CaveMap {
             }
         }
         if fdes.is_empty() {
-            return Ok(map);
+            return map;
         }
 
-        let targeted = collect_gap_targets(img, text_end, data_blocks, &fdes);
+        let targeted = collect_gap_targets(img, text_end, code_ranges, &fdes);
         let mut data_sorted = data_blocks.to_vec();
         data_sorted.sort_unstable();
 
@@ -142,7 +155,7 @@ impl CaveMap {
             });
         }
 
-        Ok(map)
+        map
     }
 
     fn push_filtered(&mut self, start: i64, end: i64, mut ok: impl FnMut(i64) -> bool) {
@@ -264,7 +277,7 @@ impl CaveMap {
 fn collect_gap_targets(
     img: &[u8],
     text_end: i64,
-    data_blocks: &[(i64, i64)],
+    code_ranges: &[(i64, i64)],
     fdes: &[(i64, i64)],
 ) -> HashSet<i64> {
     let mut out = HashSet::new();
@@ -277,7 +290,7 @@ fn collect_gap_targets(
             }
         }
     };
-    for (cs, ce) in code_ranges(data_blocks, text_end) {
+    for &(cs, ce) in code_ranges {
         let mut a = (cs + 3) & !3;
         let end = ce & !3;
         while a < end {

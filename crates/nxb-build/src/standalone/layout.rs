@@ -244,8 +244,8 @@ pub(crate) fn shape(
                     let back_len = f.need("BACK_LEN")?;
                     if back_off < 0
                         || back_len < 0
-                        || (back_off as u64) % PAGE != 0
-                        || (back_len as u64) % PAGE != 0
+                        || !(back_off as u64).is_multiple_of(PAGE)
+                        || !(back_len as u64).is_multiple_of(PAGE)
                     {
                         return Err(bad(format!(
                             "the back patch area ({back_off:#x}, len {back_len:#x}) is negative or not 16K aligned"

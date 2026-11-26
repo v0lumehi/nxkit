@@ -136,6 +136,10 @@ pub struct HostEnv {
     pub save_sync: Option<String>,
     /// `NXKIT_SAVE_SYNC_CHOICE` (set by the launcher, no launch option): the player's choice, as given.
     pub save_sync_choice: Option<String>,
+    /// `NXKIT_OODLE_ADDR`: override address (`<module>+<hex>` or `<hex>`) for `oodle-serve`.
+    pub oodle_addr: Option<String>,
+    /// `NXKIT_OODLE_NO_BOOT=1`: skip guest module initializers in `oodle-serve`.
+    pub oodle_no_boot: bool,
 }
 
 impl Default for HostEnv {
@@ -262,6 +266,10 @@ impl HostEnv {
             nick: not_blank(env, launch::NICK),
             save_sync: not_blank(env, launch::SAVE_SYNC).map(|v| v.trim().to_owned()),
             save_sync_choice: not_blank(env, launch::SAVE_SYNC_CHOICE).map(|v| v.trim().to_owned()),
+            oodle_addr: not_blank(env, "NXKIT_OODLE_ADDR"),
+            oodle_no_boot: env
+                .var("NXKIT_OODLE_NO_BOOT")
+                .is_ok_and(|v| v.trim() == "1"),
         }
     }
 }

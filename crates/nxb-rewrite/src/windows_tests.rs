@@ -79,6 +79,8 @@ fn rw_of(words: &[u32]) -> Rw {
         caves: None,
         cave_data_blocks: Vec::new(),
         cave_excluded: std::collections::HashSet::new(),
+        cave_fdes: Vec::new(),
+        cave_code_ranges: Vec::new(),
         gates: Vec::new(),
         nfix: 0,
         stats: Vec::new(),

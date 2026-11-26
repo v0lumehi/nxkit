@@ -42,7 +42,6 @@ pub mod safe_path;
 pub mod sparse;
 pub mod split;
 pub mod split_cli;
-mod split_dir;
 pub mod split_out;
 pub mod storage;
 pub mod version;

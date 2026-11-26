@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use nxb_a64::{Insn, Op, Reg, decode, encode};
 
 use crate::error::{RewriteError, fail};
-use crate::relay::CaveMap;
+use crate::relay::{CaveInput, CaveMap};
 
 /// Result of a rewrite step.
 pub(crate) type R<T> = Result<T, RewriteError>;
@@ -49,6 +49,8 @@ pub(crate) struct Rw {
     pub(crate) caves: Option<CaveMap>,
     pub(crate) cave_data_blocks: Vec<(i64, i64)>,
     pub(crate) cave_excluded: HashSet<i64>,
+    pub(crate) cave_fdes: Vec<(i64, i64)>,
+    pub(crate) cave_code_ranges: Vec<(i64, i64)>,
     pub(crate) gates: Vec<Gate>,
     pub(crate) nfix: usize,
     pub(crate) stats: Vec<(String, usize)>,
@@ -77,18 +79,20 @@ impl Rw {
         }
     }
 
-    fn ensure_caves(&mut self) -> R<()> {
-        if self.caves.is_none() {
-            self.caves = Some(CaveMap::build(
-                &self.img,
-                self.text_end,
-                self.ro_off,
-                self.data_off,
-                &self.cave_data_blocks,
-                &self.cave_excluded,
-            )?);
-        }
-        Ok(())
+    fn ensure_caves(&mut self) -> R<&mut CaveMap> {
+        let map = self.caves.get_or_insert_with(|| {
+            CaveMap::build(&CaveInput {
+                img: &self.img,
+                text_end: self.text_end,
+                ro_off: self.ro_off,
+                data_off: self.data_off,
+                data_blocks: &self.cave_data_blocks,
+                excluded: &self.cave_excluded,
+                fdes: &self.cave_fdes,
+                code_ranges: &self.cave_code_ranges,
+            })
+        });
+        Ok(map)
     }
 
     /// Emits what follows into the patch area that reaches the code at offset `a`.
@@ -159,17 +163,14 @@ impl Rw {
         if crate::relay::b_reaches(from, to) {
             return reach(encode::b(from, to));
         }
-        self.ensure_caves()?;
-        let hops = self
-            .caves
-            .as_mut()
-            .expect("caves initialized")
-            .alloc_chain(from, to)?;
+        let hops = self.ensure_caves()?.alloc_chain(from, to)?;
         for w in hops.windows(2) {
             let insn = reach(encode::b(w[0], w[1]))?;
             self.put32(w[0], insn);
         }
-        let last = *hops.last().expect("non-empty hops");
+        let Some(&last) = hops.last() else {
+            return reach(encode::b(from, to));
+        };
         let insn = reach(encode::b(last, to))?;
         self.put32(last, insn);
         reach(encode::b(from, hops[0]))

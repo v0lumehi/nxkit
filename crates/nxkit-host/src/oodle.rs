@@ -25,25 +25,22 @@ const SCRATCH_SIZE: usize = 16 << 20;
 
 fn parse_override(raw: &str, modules: &[Module]) -> Result<u64> {
     if let Some((name, off)) = raw.split_once('+') {
-        let m = modules
-            .iter()
-            .find(|m| m.name == name)
-            .ok_or_else(|| HostError::App(format!("NXKIT_OODLE_ADDR: unknown module {name}")))?;
+        let m = modules.iter().find(|m| m.name == name).ok_or_else(|| {
+            HostError::App(format!("oodle decoder override: unknown module {name}"))
+        })?;
         let off = u64::from_str_radix(off.trim().trim_start_matches("0x"), 16)
-            .map_err(|_| HostError::App(format!("NXKIT_OODLE_ADDR: bad hex offset {off}")))?;
+            .map_err(|_| HostError::App(format!("oodle decoder override: bad hex offset {off}")))?;
         return Ok(m.base.wrapping_add(off));
     }
     u64::from_str_radix(raw.trim().trim_start_matches("0x"), 16)
-        .map_err(|_| HostError::App(format!("NXKIT_OODLE_ADDR: bad hex address {raw}")))
+        .map_err(|_| HostError::App(format!("oodle decoder override: bad hex address {raw}")))
 }
 
-fn locate_decoder(modules: &[Module]) -> Result<FoundDecoder> {
-    if let Ok(raw) = std::env::var("NXKIT_OODLE_ADDR")
-        && !raw.trim().is_empty()
-    {
+fn locate_decoder(modules: &[Module], addr_override: Option<&str>) -> Result<FoundDecoder> {
+    if let Some(raw) = addr_override {
         return Ok(FoundDecoder {
             module: "override".into(),
-            addr: parse_override(&raw, modules)?,
+            addr: parse_override(raw, modules)?,
             how: "env",
         });
     }
@@ -184,7 +181,7 @@ pub fn serve(root: &Path) -> Result<()> {
     let program_args = placed.game.program_args(placed.game.settings.render_dims());
     let mut loaded = loader::load(placed, mask)?;
     guestsym::set(std::mem::take(&mut loaded.exports));
-    let found = locate_decoder(&loaded.game.modules)?;
+    let found = locate_decoder(&loaded.game.modules, env.oodle_addr.as_deref())?;
     eprintln!(
         "nxkit-host: oodle-serve using {} ({}) at {:#x}",
         found.module, found.how, found.addr
@@ -192,7 +189,7 @@ pub fn serve(root: &Path) -> Result<()> {
     let main_handle = seams::attach_main_thread()?;
     let thread_env = thread::ThreadEnv::new()?;
     let sp = layout.main_stack.end();
-    if std::env::var_os("NXKIT_OODLE_NO_BOOT").is_none_or(|v| v != "1")
+    if !env.oodle_no_boot
         && let Ok(boot) = Boot::resolve(std::mem::take(&mut loaded.inits), &program_args)
     {
         boot.init(main_handle, sp);

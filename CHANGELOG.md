@@ -4,6 +4,16 @@ All notable changes are in this file. The format follows Keep a Changelog. Versi
 
 ## Unreleased
 
+## 0.16.6 - 2026-11-26
+
+### Fixed
+
+- `nxb-extract` unpacks zstd streams directly from NUP files over 8 GiB, detects Switch 2 multi-`BASE` titles, and parses short BKTR tables.
+- `nxb-build` streams `.nro` discovery from disk, accepts Switch 2 program IDs and multi-program NSP layouts, and signs standalone bundles.
+- `nxb-build` keeps user game data across bundle updates and clarifies diagnostic exit codes.
+- `nxkit-host` ignores macOS LaunchServices flags, honors `--fullscreen` in bundles, and logs launch errors to `last-error.log`.
+- Graphics and Ocarina of Time: capture indirect draw arguments, keep conditional draw state across submits, reduce foliage artifacts and stop Snapshot oscillation, and turn on `enc_thread`.
+
 ## 0.16.5 - 2026-11-24
 
 ### Fixed

@@ -164,7 +164,6 @@ impl Rw {
         self.emit(encode::mrs_tpidrro(16));
         self.emit_slot_addr(16, 17, K18)?;
         self.emit(encode::ldrx(16, 16, 0));
-        self.emit(encode::ldur(17, 31, -24));
         let padbase = start + 4 * 24;
         let delta = padbase - base;
         let dl = delta.unsigned_abs();
@@ -185,13 +184,26 @@ impl Rw {
         if lo != 0 {
             ops.push(op(lo, 0));
         }
-        if ops.len() > 12 {
-            return fail("assertion failed: br offset ops");
+        if ops.len() <= 12 {
+            self.emit(encode::ldur(17, 31, -24));
+            for o in ops {
+                self.emit(o);
+            }
+            self.emit(encode::br(16));
+        } else {
+            let d = delta as u64;
+            self.emit(0xd280_0000 | (((d & 0xffff) as u32) << 5) | 17);
+            for sh in [16u32, 32, 48] {
+                let part = ((d >> sh) & 0xffff) as u32;
+                if part != 0 {
+                    let hw = sh / 16;
+                    self.emit(0xf280_0000 | (hw << 21) | (part << 5) | 17);
+                }
+            }
+            self.emit(encode::addr(16, 16, 17));
+            self.emit(encode::ldur(17, 31, -24));
+            self.emit(encode::br(16));
         }
-        for o in ops {
-            self.emit(o);
-        }
-        self.emit(encode::br(16));
         while self.here() < padbase {
             self.emit(encode::NOP);
         }
@@ -341,5 +353,73 @@ impl Rw {
             orig: off,
         });
         Ok(start)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::relay::CaveMap;
+    use std::collections::HashSet;
+
+    #[test]
+    fn site_br_handles_large_delta_beyond_12_add_sub_ops() {
+        let mut rw = Rw {
+            name: "t".into(),
+            img: vec![0u8; 0x1000],
+            text_end: 0x1000,
+            far: true,
+            front: 0x100_0000,
+            big_text: true,
+            two: true,
+            split: 0xe3e_0000,
+            back_min: 0xe3e_0000,
+            key_page_off: 0x1600_0000,
+            image_size: 0x162e_0000,
+            patch_off: -0x100_0000,
+            back_off: 0x162e_0000,
+            file_image_len: 0x1600_0000,
+            ro_off: 0x1000,
+            data_off: 0x1000,
+            front_area: Vec::new(),
+            back_area: Vec::new(),
+            in_back: false,
+            caves: Some(CaveMap::default()),
+            cave_data_blocks: Vec::new(),
+            cave_excluded: HashSet::new(),
+            gates: Vec::new(),
+            nfix: 0,
+            stats: Vec::new(),
+        };
+        // base at 0xd00_0000 is 224 MiB from patch_off (-0x100_0000), requiring >12 add/sub ops
+        // if not using movz/movk. Put a cave at 0x6f0_0000..0x6f0_0040 to bridge tail branches.
+        let mut img = vec![0u8; 0x6f0_0040];
+        img[..4].copy_from_slice(&0xd65f_03c0u32.to_le_bytes());
+        rw.img = img;
+        rw.text_end = 0x6f0_0040;
+        let mut caves = CaveMap::default();
+        // Give CaveMap a relay range directly at 0x6f0_0000..0x6f0_0040 via build? No, test movz/movk
+        // with base within 128 MiB of back_off? No, delta > 192 MiB only happens when base is > 192 MiB away!
+        // Here 0xd00_0000 is within 128 MiB of back_off (0x162e_0000) if in_back, or if in_back = false:
+        // test delta = padbase - base = -0xe00_0000 using movz/movk while count = 0 (no tail branches).
+        let _ = &mut caves;
+        let st = rw.site_br(0xd00_0000, 0).unwrap();
+        assert_eq!(st, -0x100_0000);
+        // Decode emitted words before padbase and confirm movz + movk + add x16, x16, x17 + br x16.
+        let mnemonics: Vec<&str> = rw
+            .front_area
+            .chunks_exact(4)
+            .take(15)
+            .filter_map(|c| {
+                let w = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                dis(w, st).ok().map(|i| i.mn)
+            })
+            .collect();
+        assert!(
+            mnemonics.contains(&"movz") || mnemonics.contains(&"mov"),
+            "{mnemonics:?}"
+        );
+        assert!(mnemonics.contains(&"movk"), "{mnemonics:?}");
+        assert!(mnemonics.contains(&"br"), "{mnemonics:?}");
     }
 }

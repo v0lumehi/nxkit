@@ -61,23 +61,21 @@ fn layout(nso: &[u8], opts: &Options, front_env: Option<u64>) -> R<Layout> {
     let big_text = far && text_end + front > 0x800_0000 - 0x1_0000;
     let two = big_text && text_end > 0x800_0000 - 0x1_0000;
     let env = front_env.filter(|v| *v != 0).map(|v| v as i64);
+    let back_off_if_two =
+        ((((m.image.len() + bss + 0x3fff) & !0x3fff) + 0x8000 + 0xffff) & !0xffff) as i64;
     // TWO: the lowest site the back area reaches with the margin (BACK_OFF less the reach, plus 1 MB)
     let back_min = if two {
-        let b = ((((m.image.len() + bss + 0x3fff) & !0x3fff) + 0x8000 + 0xffff) & !0xffff) as i64
-            - 0x800_0000
-            + 0x10_0000;
-        if b >= 0x800_0000 - 0x20_0000 {
-            return fail(format!(
-                "assertion failed: no split reaches: the back patch area reaches no site below {b:#x}, too close to the front area's reach"
-            ));
-        }
-        b
+        back_off_if_two - 0x800_0000 + 0x10_0000
     } else {
         0
     };
     if two {
-        front =
-            env.unwrap_or_else(|| 0x100_0000.min((0x800_0000 - 0x10_0000 - back_min) & !0xffff));
+        if back_min < 0x800_0000 - 0x20_0000 {
+            front = env
+                .unwrap_or_else(|| 0x100_0000.min((0x800_0000 - 0x10_0000 - back_min) & !0xffff));
+        } else {
+            front = env.unwrap_or(0x100_0000);
+        }
     } else if big_text {
         front = env.unwrap_or((0x800_0000 - 0x1_0000 - text_end) & !0xffff);
     }
@@ -123,6 +121,7 @@ fn layout(nso: &[u8], opts: &Options, front_env: Option<u64>) -> R<Layout> {
         big_text,
         two,
         split,
+        back_min,
         key_page_off,
         image_size,
         patch_off,
@@ -133,6 +132,9 @@ fn layout(nso: &[u8], opts: &Options, front_env: Option<u64>) -> R<Layout> {
         front_area: Vec::new(),
         back_area: Vec::new(),
         in_back: false,
+        caves: None,
+        cave_data_blocks: Vec::new(),
+        cave_excluded: HashSet::new(),
         gates: Vec::new(),
         nfix: 0,
         stats: Vec::new(),
@@ -235,6 +237,30 @@ fn run_inner(
         tailcalls,
         done,
     } = analysis;
+    let reg_obs = patches.obs.get(&build_id).cloned().unwrap_or_default();
+    if rw.two {
+        let mut excl: HashSet<i64> = scan.kinds.keys().copied().collect();
+        excl.extend(done.iter().copied());
+        excl.extend(reg_obs.iter().map(|o| o.off as i64));
+        if let Some(m) = &ue.malloc {
+            excl.insert(m.call as i64);
+        }
+        if let Some(r) = &ue.region {
+            excl.insert(r.off as i64);
+            if let Some(x) = r.x1 {
+                excl.insert(x as i64);
+            }
+        }
+        for c in &cuts {
+            let mut o = c.off as i64;
+            while o < c.off as i64 + (c.old.len() / 2) as i64 {
+                excl.insert(o);
+                o += 4;
+            }
+        }
+        rw.cave_data_blocks = scan.data_blocks.clone();
+        rw.cave_excluded = excl;
+    }
     // rewrite the sites
     for w in &windows {
         rw.use_area(w[0].addr as i64);
@@ -326,7 +352,6 @@ fn run_inner(
         };
         rw.put_branch(a, st)?;
     }
-    let reg_obs = patches.obs.get(&build_id).cloned().unwrap_or_default();
     rw.apply_obs(&reg_obs, &scan.kinds, &windows)?;
     let sym_obs = rw.symbol_gates(
         &scan.kinds,

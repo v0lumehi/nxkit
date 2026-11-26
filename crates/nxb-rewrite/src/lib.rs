@@ -33,6 +33,7 @@ mod pat;
 /// The registered patches of the engine.
 pub mod patches;
 mod region;
+mod relay;
 mod rewrite;
 mod ring;
 #[cfg(test)]

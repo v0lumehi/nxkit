@@ -1,9 +1,12 @@
 //! The rewriter's state (the module-level variables of `patch_nso.py`): the image, the layout, the patch areas
 //! and the helpers every rule uses.
 
+use std::collections::HashSet;
+
 use nxb_a64::{Insn, Op, Reg, decode, encode};
 
 use crate::error::{RewriteError, fail};
+use crate::relay::CaveMap;
 
 /// Result of a rewrite step.
 pub(crate) type R<T> = Result<T, RewriteError>;
@@ -32,6 +35,7 @@ pub(crate) struct Rw {
     pub(crate) big_text: bool,
     pub(crate) two: bool,
     pub(crate) split: i64,
+    pub(crate) back_min: i64,
     pub(crate) key_page_off: i64,
     pub(crate) image_size: i64,
     pub(crate) patch_off: i64,
@@ -42,6 +46,9 @@ pub(crate) struct Rw {
     pub(crate) front_area: Vec<u8>,
     pub(crate) back_area: Vec<u8>,
     pub(crate) in_back: bool,
+    pub(crate) caves: Option<CaveMap>,
+    pub(crate) cave_data_blocks: Vec<(i64, i64)>,
+    pub(crate) cave_excluded: HashSet<i64>,
     pub(crate) gates: Vec<Gate>,
     pub(crate) nfix: usize,
     pub(crate) stats: Vec<(String, usize)>,
@@ -70,9 +77,52 @@ impl Rw {
         }
     }
 
+    fn ensure_caves(&mut self) -> R<()> {
+        if self.caves.is_none() {
+            self.caves = Some(CaveMap::build(
+                &self.img,
+                self.text_end,
+                self.ro_off,
+                self.data_off,
+                &self.cave_data_blocks,
+                &self.cave_excluded,
+            )?);
+        }
+        Ok(())
+    }
+
     /// Emits what follows into the patch area that reaches the code at offset `a`.
     pub(crate) fn use_area(&mut self, a: i64) {
-        self.in_back = self.two && a >= self.split;
+        if !self.two {
+            self.in_back = false;
+            return;
+        }
+        let front_max = 0x800_0000 - self.front - 0x10_0000;
+        if self.back_min <= front_max {
+            self.in_back = a >= self.split;
+            return;
+        }
+        if a < front_max {
+            self.in_back = false;
+        } else if a >= self.back_min {
+            self.in_back = true;
+        } else {
+            if self.ensure_caves().is_err() {
+                self.in_back = false;
+                return;
+            }
+            let f_here = self.patch_off + self.front_area.len() as i64;
+            let b_here = self.back_off + self.back_area.len() as i64;
+            let (f_hops, b_hops) = match self.caves.as_ref() {
+                Some(c) => (c.hop_count(a, f_here), c.hop_count(a, b_here)),
+                None => (None, None),
+            };
+            self.in_back = match (f_hops, b_hops) {
+                (Some(fh), Some(bh)) => bh < fh || (bh == fh && (b_here - a) < (a - f_here)),
+                (None, Some(_)) => true,
+                _ => false,
+            };
+        }
     }
 
     fn area(&self) -> &Vec<u8> {
@@ -103,16 +153,38 @@ impl Rw {
         a.extend_from_slice(&w.to_le_bytes());
     }
 
-    /// `b` from here to `to`.
+    /// Encodes `b to` from `from`, allocating multi-hop relay caves in `.text` when `to` is
+    /// beyond ±128 MiB.
+    pub(crate) fn branch_word(&mut self, from: i64, to: i64) -> R<u32> {
+        if crate::relay::b_reaches(from, to) {
+            return reach(encode::b(from, to));
+        }
+        self.ensure_caves()?;
+        let hops = self
+            .caves
+            .as_mut()
+            .expect("caves initialized")
+            .alloc_chain(from, to)?;
+        for w in hops.windows(2) {
+            let insn = reach(encode::b(w[0], w[1]))?;
+            self.put32(w[0], insn);
+        }
+        let last = *hops.last().expect("non-empty hops");
+        let insn = reach(encode::b(last, to))?;
+        self.put32(last, insn);
+        reach(encode::b(from, hops[0]))
+    }
+
+    /// `b` from here to `to` (via relays if beyond ±128 MiB).
     pub(crate) fn emit_b(&mut self, to: i64) -> R<()> {
-        let w = reach(encode::b(self.here(), to))?;
+        let w = self.branch_word(self.here(), to)?;
         self.emit(w);
         Ok(())
     }
 
-    /// Writes `b to` over the instruction at `at` in the image.
+    /// Writes `b to` over the instruction at `at` in the image (via relays if beyond ±128 MiB).
     pub(crate) fn put_branch(&mut self, at: i64, to: i64) -> R<()> {
-        let w = reach(encode::b(at, to))?;
+        let w = self.branch_word(at, to)?;
         self.put32(at, w);
         Ok(())
     }

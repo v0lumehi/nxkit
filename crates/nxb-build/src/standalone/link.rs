@@ -102,3 +102,47 @@ pub(crate) fn write_dylib(
     bundle::sign(&path)?;
     Ok(bytes.len() as u64)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::standalone::elf::Symbols;
+    use crate::standalone::layout::{self, Fixups};
+
+    #[test]
+    fn links_two_area_module_into_macho_dylib() {
+        let fixups = "# PATCH_OFF\t-0x20000\n# KEY_PAGE_OFF\t0x40000\n# KEY_PAGE_SIZE\t0x4000\n# TEXT_END\t0x10000\n# RO_OFF\t0x10000\n# DATA_OFF\t0x20000\n# IMAGE_SIZE\t0x68000\n# FILE_IMAGE_LEN\t0x30000\n# BACK_OFF\t0x60000\n# BACK_LEN\t0x8000\n";
+        let mut image = vec![0u8; 0x3c000];
+        image[0..4].copy_from_slice(&0xd65f_03c0u32.to_le_bytes()); // TEXT
+        image[0x30000..0x30004].copy_from_slice(&0x1400_0001u32.to_le_bytes()); // PATCH
+        image[0x34000..0x34004].copy_from_slice(&0xd503_201fu32.to_le_bytes()); // BACK
+        let shape = layout::shape("main", 0, image.len(), &Fixups::parse(fixups)).unwrap();
+        let bases = layout::bases(std::slice::from_ref(&shape));
+        let built = Built {
+            name: "main".into(),
+            build_id: "0123456789abcdef0123456789abcdef".into(),
+            shape,
+            parts: [(0, 0x10000), (0x10000, 0x10000), (0x20000, 0x10000)],
+            bss: 0x10000,
+            image,
+            symbols: Symbols::default(),
+            fixups: fixups.into(),
+            gates: Vec::new(),
+        };
+        let bytes = dylib(&[(built, bases[0])]).unwrap();
+        // Verify Mach-O header and that all 4 module segment names are present.
+        assert_eq!(&bytes[0..4], &0xfeed_facfu32.to_le_bytes());
+        for seg_name in [
+            b"__NX_MAIN_PATCH\0" as &[u8],
+            b"__NX_MAIN_TEXT\0\0",
+            b"__NX_MAIN_DATA\0\0",
+            b"__NX_MAIN_BACK\0\0",
+        ] {
+            assert!(
+                bytes.windows(seg_name.len()).any(|w| w == seg_name),
+                "missing segment {:?}",
+                String::from_utf8_lossy(seg_name)
+            );
+        }
+    }
+}

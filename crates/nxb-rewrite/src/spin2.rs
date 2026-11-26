@@ -136,7 +136,10 @@ impl Rw {
         for (idx, x, info) in fixes {
             let pc = self.patch_base() + idx as i64;
             let w = match (&x, &info) {
-                (None, Info::Cpy(v)) => reach(encode::b(pc, cpy.get(v).copied().unwrap_or(*v)))?,
+                (None, Info::Cpy(v)) => match cpy.get(v).copied() {
+                    Some(tgt) => reach(encode::b(pc, tgt))?,
+                    None => self.branch_word(pc, *v)?,
+                },
                 (None, _) => return fail("spin fix"),
                 (Some(x), Info::Orig(o)) => {
                     let d = self.spin_out(&mut tramp, *o)?;
@@ -146,16 +149,16 @@ impl Rw {
                 (Some(x), Info::None) => {
                     let tg = x.target().unwrap_or(0) as i64;
                     let cond = x.mn != "b";
-                    let d = if tg == t && g.valid.contains(&(x.addr as i64)) {
-                        pause
+                    if tg == t && g.valid.contains(&(x.addr as i64)) {
+                        spin_rebranch(x, pc, pause)?
                     } else if cpy.contains_key(&tg) && tg != t {
-                        cpy[&tg]
+                        spin_rebranch(x, pc, cpy[&tg])?
                     } else if cond {
-                        self.spin_out(&mut tramp, tg)?
+                        let d = self.spin_out(&mut tramp, tg)?;
+                        spin_rebranch(x, pc, d)?
                     } else {
-                        tg
-                    };
-                    spin_rebranch(x, pc, d)?
+                        self.branch_word(pc, tg)?
+                    }
                 }
             };
             self.patch_write(idx, w);

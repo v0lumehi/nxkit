@@ -10,8 +10,13 @@
 //! area, which belongs at `PATCH_OFF` (negative, before the base). The bss and the key page follow the image up to
 //! `IMAGE_SIZE` and are zero.
 //!
-//! Each module becomes three segments: `__NX_<NAME>_TEXT` (r-x, text and rodata up to the data's first page),
-//! `__NX_<NAME>_DATA` (rw-, data, bss and key page) and `__NX_<NAME>_PATCH` (r-x, the patch area).
+//! Two-area far layout (`BACK_OFF` and `BACK_LEN` in addition to `IMAGE_SIZE`): the file holds the image padded to
+//! `FILE_IMAGE_LEN`, then the front patch area, then `BACK_LEN` bytes of the back patch area. The back patch area
+//! belongs at `BACK_OFF` (positive, after the key page and any frame-step state page) in `__NX_<NAME>_BACK` (r-x).
+//!
+//! Each module becomes `__NX_<NAME>_TEXT` (r-x, text and rodata up to the data's first page), `__NX_<NAME>_DATA`
+//! (rw-, data, bss and key page), `__NX_<NAME>_PATCH` (r-x, the front patch area) and, for the two-area layout,
+//! `__NX_<NAME>_BACK` (r-x, the back patch area).
 
 use std::collections::BTreeMap;
 
@@ -96,11 +101,6 @@ impl Fixups {
         self.num(key)?
             .ok_or_else(|| format!("fixups: the header has no {key}"))
     }
-
-    /// Whether the header has the key.
-    pub(crate) fn has(&self, key: &str) -> bool {
-        self.0.contains_key(key)
-    }
 }
 
 fn up(v: u64) -> u64 {
@@ -127,17 +127,13 @@ pub(crate) fn shape(
     f: &Fixups,
 ) -> Result<Shape, String> {
     let bad = |m: String| format!("module {name}: {m}");
-    if f.has("BACK_OFF") {
-        return Err(format!(
-            "unsupported: module {name} has the two-area layout (BACK_OFF): the link step does not place a second code area"
-        ));
-    }
     let patch_off = f.need("PATCH_OFF")?;
     let key_off = f.need("KEY_PAGE_OFF")? as u64;
     let key_size = f.need("KEY_PAGE_SIZE")? as u64;
     let text_end = f.need("TEXT_END")? as u64;
     let data_off = f.need("DATA_OFF")? as u64;
     let far = f.num("IMAGE_SIZE")?;
+    let back_off = f.num("BACK_OFF")?;
     let p = data_off / PAGE * PAGE;
     if p < up(text_end) {
         return Err(bad(format!(
@@ -168,6 +164,9 @@ pub(crate) fn shape(
     let patch_size;
     match far {
         None => {
+            if back_off.is_some() {
+                return Err(bad("the two-area layout needs IMAGE_SIZE".into()));
+            }
             // The rewriter puts the patch area at the next 64K border after the image, and the key page at the next 16K
             // border. The bytes between the key page and the patch area are zero and nothing points there. No segment
             // covers them, so the host maps them with no access.
@@ -191,52 +190,127 @@ pub(crate) fn shape(
                 key_end - p,
                 false,
             ));
-            segments.push(seg(
-                "PATCH",
-                patch_off,
-                patch_off as usize,
-                patch_size as usize,
-                patch_size,
-                true,
-            ));
+            if patch_size > 0 {
+                segments.push(seg(
+                    "PATCH",
+                    patch_off,
+                    patch_off as usize,
+                    patch_size as usize,
+                    patch_size,
+                    true,
+                ));
+            }
         }
         Some(image_size) => {
             let image_size = image_size as u64;
             let image_len = f.need("FILE_IMAGE_LEN")? as usize;
-            if patch_off >= 0 || file_len < image_len || image_len as u64 > image_size {
-                return Err(bad(format!(
-                    "the far layout is inconsistent (patch {patch_off:#x}, file {file_len:#x}, image in file {image_len:#x}, image {image_size:#x})"
-                )));
-            }
             if key_off + key_size > image_size {
                 return Err(bad("the key page is outside the image".into()));
             }
-            patch_size = (file_len - image_len) as u64;
-            if patch_off + up(patch_size) as i64 > 0 {
-                return Err(bad(format!(
-                    "the patch area at {patch_off:#x} reaches the base"
-                )));
-            }
             let data_file = image_len.saturating_sub(p as usize);
-            segments.push(seg(
-                "DATA",
-                p as i64,
-                p as usize,
-                data_file,
-                image_size - p,
-                false,
-            ));
-            segments.insert(
-                0,
-                seg(
-                    "PATCH",
-                    patch_off,
-                    image_len,
-                    patch_size as usize,
-                    patch_size,
-                    true,
-                ),
-            );
+            match back_off {
+                None => {
+                    if patch_off >= 0 || file_len < image_len || image_len as u64 > image_size {
+                        return Err(bad(format!(
+                            "the far layout is inconsistent (patch {patch_off:#x}, file {file_len:#x}, image in file {image_len:#x}, image {image_size:#x})"
+                        )));
+                    }
+                    patch_size = (file_len - image_len) as u64;
+                    if patch_off + up(patch_size) as i64 > 0 {
+                        return Err(bad(format!(
+                            "the patch area at {patch_off:#x} reaches the base"
+                        )));
+                    }
+                    segments.push(seg(
+                        "DATA",
+                        p as i64,
+                        p as usize,
+                        data_file,
+                        image_size - p,
+                        false,
+                    ));
+                    if patch_size > 0 {
+                        segments.push(seg(
+                            "PATCH",
+                            patch_off,
+                            image_len,
+                            patch_size as usize,
+                            patch_size,
+                            true,
+                        ));
+                    }
+                }
+                Some(back_off) => {
+                    let back_len = f.need("BACK_LEN")?;
+                    if back_off < 0
+                        || back_len < 0
+                        || (back_off as u64) % PAGE != 0
+                        || (back_len as u64) % PAGE != 0
+                    {
+                        return Err(bad(format!(
+                            "the back patch area ({back_off:#x}, len {back_len:#x}) is negative or not 16K aligned"
+                        )));
+                    }
+                    let (back_off, back_len) = (back_off as u64, back_len as u64);
+                    let fps_end = f.num("FPS_STATE_OFF")?.map_or(0, |o| o as u64 + PAGE);
+                    let data_end = up((key_off + key_size).max(fps_end));
+                    if data_end > back_off {
+                        return Err(bad(format!(
+                            "the back patch area at {back_off:#x} overlaps the data/key area (end {data_end:#x})"
+                        )));
+                    }
+                    if back_off
+                        .checked_add(back_len)
+                        .is_none_or(|e| e > image_size)
+                    {
+                        return Err(bad(format!(
+                            "the back patch area ({back_off:#x} + {back_len:#x}) exceeds IMAGE_SIZE ({image_size:#x})"
+                        )));
+                    }
+                    if patch_off >= 0
+                        || file_len < image_len + back_len as usize
+                        || image_len as u64 > data_end
+                    {
+                        return Err(bad(format!(
+                            "the two-area layout is inconsistent (patch {patch_off:#x}, file {file_len:#x}, image in file {image_len:#x}, data end {data_end:#x}, back len {back_len:#x})"
+                        )));
+                    }
+                    patch_size = (file_len - image_len - back_len as usize) as u64;
+                    if patch_off + up(patch_size) as i64 > 0 {
+                        return Err(bad(format!(
+                            "the patch area at {patch_off:#x} reaches the base"
+                        )));
+                    }
+                    segments.push(seg(
+                        "DATA",
+                        p as i64,
+                        p as usize,
+                        data_file,
+                        data_end - p,
+                        false,
+                    ));
+                    if patch_size > 0 {
+                        segments.push(seg(
+                            "PATCH",
+                            patch_off,
+                            image_len,
+                            patch_size as usize,
+                            patch_size,
+                            true,
+                        ));
+                    }
+                    if back_len > 0 {
+                        segments.push(seg(
+                            "BACK",
+                            back_off as i64,
+                            file_len - back_len as usize,
+                            back_len as usize,
+                            back_len,
+                            true,
+                        ));
+                    }
+                }
+            }
         }
     }
     segments.sort_by_key(|s| s.offset);
@@ -335,17 +409,112 @@ mod tests {
         assert_eq!(s.extent(), (-0x20000, 0x44000));
     }
 
+    fn two_area() -> Fixups {
+        Fixups::parse(
+            "# PATCH_OFF\t-0x20000\n# KEY_PAGE_OFF\t0x40000\n# KEY_PAGE_SIZE\t0x4000\n# TEXT_END\t0x10000\n# RO_OFF\t0x10000\n# DATA_OFF\t0x20000\n# IMAGE_SIZE\t0x68000\n# FILE_IMAGE_LEN\t0x30000\n# BACK_OFF\t0x60000\n# BACK_LEN\t0x8000\n",
+        )
+    }
+
     #[test]
-    fn long_names_use_the_index_and_two_areas_are_refused() {
+    fn long_names_use_the_index() {
         let s = shape("subsdk0", 1, 0x70000, &near()).unwrap();
         assert_eq!(s.segments[0].name, "__NX_M1_TEXT");
         assert!(s.segments.iter().all(|x| x.name.len() <= 16));
-        let two = Fixups::parse("# BACK_OFF\t0x1000\n");
-        assert!(
-            shape("main", 0, 0, &two)
-                .unwrap_err()
-                .starts_with("unsupported")
+    }
+
+    #[test]
+    fn a_two_area_module_places_front_and_back_segments() {
+        // file: 0x30000 image + 0x4000 front patch + 0x8000 back patch = 0x3c000
+        let s = shape("main", 0, 0x3c000, &two_area()).unwrap();
+        let summary: Vec<_> = s
+            .segments
+            .iter()
+            .map(|x| {
+                (
+                    x.name.as_str(),
+                    x.kind,
+                    x.offset,
+                    x.file_off,
+                    x.file_len,
+                    x.mem_size,
+                    x.exec,
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (
+                    "__NX_MAIN_PATCH",
+                    "PATCH",
+                    -0x20000,
+                    0x30000,
+                    0x4000,
+                    0x4000,
+                    true
+                ),
+                ("__NX_MAIN_TEXT", "TEXT", 0, 0, 0x20000, 0x20000, true),
+                (
+                    "__NX_MAIN_DATA",
+                    "DATA",
+                    0x20000,
+                    0x20000,
+                    0x10000,
+                    0x24000,
+                    false
+                ),
+                (
+                    "__NX_MAIN_BACK",
+                    "BACK",
+                    0x60000,
+                    0x34000,
+                    0x8000,
+                    0x8000,
+                    true
+                ),
+            ]
         );
+        assert_eq!(s.patch, (-0x20000, 0x4000));
+        assert_eq!(s.extent(), (-0x20000, 0x68000));
+        let next = shape("subsdk0", 1, 0x70000, &near()).unwrap();
+        assert!(next.segments.iter().all(|x| x.name.len() <= 16));
+        let bs = bases(&[s.clone(), next.clone()]);
+        assert!(bs[1] as i64 + next.extent().0 >= (bs[0] + s.extent().1) as i64);
+    }
+
+    #[test]
+    fn two_area_with_empty_back_omits_back_segment_and_respects_fps_state() {
+        let f = Fixups::parse(
+            "# PATCH_OFF\t-0x20000\n# KEY_PAGE_OFF\t0x40000\n# KEY_PAGE_SIZE\t0x4000\n# FPS_STATE_OFF\t0x44000\n# TEXT_END\t0x10000\n# RO_OFF\t0x10000\n# DATA_OFF\t0x20000\n# IMAGE_SIZE\t0x60000\n# FILE_IMAGE_LEN\t0x30000\n# BACK_OFF\t0x60000\n# BACK_LEN\t0x0\n",
+        );
+        let s = shape("main", 0, 0x34000, &f).unwrap();
+        let kinds: Vec<_> = s.segments.iter().map(|x| x.kind).collect();
+        assert_eq!(kinds, ["PATCH", "TEXT", "DATA"]);
+        assert_eq!(s.segments[2].mem_size, 0x28000);
+        assert_eq!(s.extent(), (-0x20000, 0x48000));
+    }
+
+    #[test]
+    fn two_area_invalid_layouts_are_refused() {
+        let no_len = Fixups::parse(
+            "# PATCH_OFF\t-0x20000\n# KEY_PAGE_OFF\t0x40000\n# KEY_PAGE_SIZE\t0x4000\n# TEXT_END\t0x10000\n# RO_OFF\t0x10000\n# DATA_OFF\t0x20000\n# IMAGE_SIZE\t0x68000\n# FILE_IMAGE_LEN\t0x30000\n# BACK_OFF\t0x60000\n",
+        );
+        assert!(shape("main", 0, 0x3c000, &no_len).is_err());
+
+        let overlap = Fixups::parse(
+            "# PATCH_OFF\t-0x20000\n# KEY_PAGE_OFF\t0x40000\n# KEY_PAGE_SIZE\t0x4000\n# TEXT_END\t0x10000\n# RO_OFF\t0x10000\n# DATA_OFF\t0x20000\n# IMAGE_SIZE\t0x48000\n# FILE_IMAGE_LEN\t0x30000\n# BACK_OFF\t0x40000\n# BACK_LEN\t0x8000\n",
+        );
+        assert!(shape("main", 0, 0x3c000, &overlap).is_err());
+
+        let unaligned = Fixups::parse(
+            "# PATCH_OFF\t-0x20000\n# KEY_PAGE_OFF\t0x40000\n# KEY_PAGE_SIZE\t0x4000\n# TEXT_END\t0x10000\n# RO_OFF\t0x10000\n# DATA_OFF\t0x20000\n# IMAGE_SIZE\t0x69000\n# FILE_IMAGE_LEN\t0x30000\n# BACK_OFF\t0x61000\n# BACK_LEN\t0x8000\n",
+        );
+        assert!(shape("main", 0, 0x3c000, &unaligned).is_err());
+
+        let near_two = Fixups::parse(
+            "# PATCH_OFF\t0x60000\n# KEY_PAGE_OFF\t0x40000\n# KEY_PAGE_SIZE\t0x4000\n# TEXT_END\t0x10000\n# RO_OFF\t0x10000\n# DATA_OFF\t0x20000\n# BACK_OFF\t0x80000\n# BACK_LEN\t0x4000\n",
+        );
+        assert!(shape("main", 0, 0x84000, &near_two).is_err());
     }
 
     #[test]

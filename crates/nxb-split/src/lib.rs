@@ -7,6 +7,7 @@
 
 pub mod aes256;
 pub mod bahs;
+pub mod blte;
 pub mod bzip2;
 pub mod capcom;
 pub mod cra;

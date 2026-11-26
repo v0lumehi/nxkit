@@ -242,6 +242,12 @@ fn scan_whole(
     if d.get(..4) == Some(b"Yaz0") {
         d = crate::yaz0::decode(&d, label)?.into();
     }
+    if crate::blte::header_len(&d).is_some() {
+        let Some(dec) = crate::blte::decode(&d, label)? else {
+            return Ok(None);
+        };
+        d = dec.into();
+    }
     if d.get(..3) == Some(b"XNB")
         && d.get(4) == Some(&5)
         && d.get(5).is_some_and(|f| f & 0xc0 != 0)

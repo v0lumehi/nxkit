@@ -15,6 +15,7 @@ use crate::zstd::Dicts;
 
 pub mod arh;
 pub mod bdt;
+pub mod casc;
 pub mod cpk;
 pub mod cra;
 pub mod frostbite;
@@ -120,6 +121,10 @@ pub fn deferred(rel: &str, head: &[u8]) -> bool {
     let ext = |e: &str| rel.ends_with(e);
     let name = rel.rsplit('/').next().unwrap_or(rel);
     ext(".data")
+        || ext(".idx")
+        || (name.starts_with("data.")
+            && name.len() > 5
+            && name[5..].bytes().all(|b| b.is_ascii_digit()))
         || ext(".patch")
         || ext(".debug")
         || ext(".nxpc")
@@ -166,6 +171,7 @@ pub fn plan_with(files: &[File], nros: &NroSet) -> R<Plan> {
     zip::plan(files, &mut p)?;
     arh::plan(files, &mut p)?;
     frostbite::plan(files, &mut p)?;
+    casc::plan(files, &mut p)?;
     Ok(p)
 }
 

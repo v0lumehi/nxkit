@@ -157,8 +157,20 @@ expect: reject texture-elem:short
 void f(texture2d<short> t) { }
 
 === texture-kind
-expect: reject texture-kind:texture2d_ms
-void f(texture2d_ms<float> t) { }
+expect: reject texture-kind:texture1d
+void f(texture1d<float> t) { }
+
+=== texture2d-ms
+expect: accept
+float4 f(texture2d_ms<float> t, texture2d_ms<half, access::read> h, texture2d_ms<int> i, texture2d_ms<uint> u, uint2 px)
+{
+    float4 a = t.read(px, 0u);
+    half4 b = h.read(px, 1);
+    int4 c = i.read(px, 0u);
+    uint4 d = u.read(px, 0u);
+    uint n = t.get_width() + t.get_height() + t.get_num_samples();
+    return a + float4(b) + float4(c) + float4(d) + float4(n);
+}
 
 === thread-reference
 expect: reject thread-reference

@@ -163,3 +163,33 @@ fn deep_input_does_not_overflow_the_stack() {
         std::thread::spawn(|| matches!(check_source(&nested_parens(100_000)), Outcome::Recursion));
     assert!(h.join().unwrap());
 }
+
+#[test]
+fn texture2d_ms_defaults_to_read_access_and_types_methods() {
+    let c = checked(
+        "uint f(texture2d_ms<float> tf, texture2d_ms<half, access::read> th, uint2 px) { \
+         float4 a = tf.read(px, 0u); \
+         half4 b = th.read(px, 1); \
+         return tf.get_width() + tf.get_height() + tf.get_num_samples() + uint(a.x) + uint(b.x); \
+         }",
+    );
+    assert!(c.reasons.is_empty(), "{:?}", c.reasons);
+    let f = function(&c.module, "f");
+    assert_eq!(
+        f.sig.params[0].ty,
+        Ty::Tex {
+            kind: "texture2d_ms".into(),
+            el: Scalar::Float,
+            access: "read".into(),
+        }
+    );
+    assert_eq!(
+        f.sig.params[1].ty,
+        Ty::Tex {
+            kind: "texture2d_ms".into(),
+            el: Scalar::Half,
+            access: "read".into(),
+        }
+    );
+    assert_eq!(f.sig.ret, ty::UINT);
+}

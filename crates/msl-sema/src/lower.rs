@@ -277,8 +277,18 @@ impl Cx {
             Ty::Tex { kind, el, access } => {
                 let k = TexKind::from_name(kind)
                     .ok_or_else(|| Error::unsupported(format!("texture:{kind}")))?;
-                let a = Access::from_name(access)
-                    .ok_or_else(|| Error::unsupported(format!("access:{access}")))?;
+                let a = if k == TexKind::T2dMs && access.is_empty() {
+                    Access::Read
+                } else {
+                    Access::from_name(access)
+                        .ok_or_else(|| Error::unsupported(format!("access:{access}")))?
+                };
+                if k == TexKind::T2dMs && a != Access::Read {
+                    return Err(Error::unsupported(format!(
+                        "texture2d_ms:access:{}",
+                        a.name()
+                    )));
+                }
                 Type::Texture(Tex {
                     kind: k,
                     elem: *el,
@@ -1478,24 +1488,39 @@ impl Cx {
                 let dim = tx.kind.coord_dim();
                 let coord = conv(self.expr(&args[0])?, &Type::vec(Scalar::Uint, dim))?;
                 let mut rest = &args[1..];
-                let array = if tx.kind.is_array() {
-                    let a = rest.first().ok_or_else(|| Error::invalid("read slice"))?;
-                    rest = &rest[1..];
-                    Some(Box::new(conv(self.expr(a)?, &Type::UINT)?))
-                } else {
-                    None
-                };
                 if tx.kind == TexKind::T2dMs {
-                    return Err(Error::unsupported("method:read:texture2d_ms"));
-                }
-                let lod = lod_arg(self, rest.first())?;
-                TexOp::Read {
-                    coord: Box::new(coord),
-                    array,
-                    lod,
+                    let s = rest.first().ok_or_else(|| Error::invalid("read sample"))?;
+                    if rest.len() > 1 {
+                        return Err(Error::invalid("read extra args"));
+                    }
+                    let sample = Some(Box::new(conv(self.expr(s)?, &Type::UINT)?));
+                    TexOp::Read {
+                        coord: Box::new(coord),
+                        array: None,
+                        lod: None,
+                        sample,
+                    }
+                } else {
+                    let array = if tx.kind.is_array() {
+                        let a = rest.first().ok_or_else(|| Error::invalid("read slice"))?;
+                        rest = &rest[1..];
+                        Some(Box::new(conv(self.expr(a)?, &Type::UINT)?))
+                    } else {
+                        None
+                    };
+                    let lod = lod_arg(self, rest.first())?;
+                    TexOp::Read {
+                        coord: Box::new(coord),
+                        array,
+                        lod,
+                        sample: None,
+                    }
                 }
             }
             "write" => {
+                if tx.kind == TexKind::T2dMs {
+                    return Err(Error::unsupported("method:write:texture2d_ms"));
+                }
                 let value = conv(self.expr(&args[0])?, &Type::Vector(tx.elem, 4))?;
                 let dim = tx.kind.coord_dim();
                 let coord = conv(self.expr(&args[1])?, &Type::vec(Scalar::Uint, dim))?;
@@ -1515,22 +1540,43 @@ impl Cx {
                     lod,
                 }
             }
-            "get_width" | "get_height" | "get_depth" | "get_array_size" | "get_num_mip_levels" => {
+            "get_width" | "get_height" | "get_depth" | "get_array_size" | "get_num_mip_levels"
+            | "get_num_samples" => {
                 let what = match name {
                     "get_width" => Query::Width,
                     "get_height" => Query::Height,
                     "get_depth" => Query::Depth,
                     "get_array_size" => Query::ArraySize,
-                    _ => Query::MipLevels,
+                    "get_num_mip_levels" => Query::MipLevels,
+                    _ => Query::NumSamples,
                 };
-                let lod = if matches!(what, Query::Width | Query::Height | Query::Depth) {
-                    lod_arg(self, args.first())?
+                if tx.kind == TexKind::T2dMs {
+                    if !matches!(what, Query::Width | Query::Height | Query::NumSamples) {
+                        return Err(Error::unsupported(format!("method:{name}:texture2d_ms")));
+                    }
+                    if !args.is_empty() {
+                        return Err(Error::invalid("query-arg:texture2d_ms"));
+                    }
+                    TexOp::Query { what, lod: None }
                 } else {
-                    None
-                };
-                TexOp::Query { what, lod }
+                    if what == Query::NumSamples {
+                        return Err(Error::unsupported(format!(
+                            "method:get_num_samples:{}",
+                            tx.kind.name()
+                        )));
+                    }
+                    let lod = if matches!(what, Query::Width | Query::Height | Query::Depth) {
+                        lod_arg(self, args.first())?
+                    } else {
+                        None
+                    };
+                    TexOp::Query { what, lod }
+                }
             }
             "calculate_clamped_lod" | "calculate_unclamped_lod" => {
+                if tx.kind == TexKind::T2dMs {
+                    return Err(Error::unsupported(format!("method:{name}:texture2d_ms")));
+                }
                 let sampler = self.expr(&args[0])?;
                 let coord = conv(
                     self.expr(&args[1])?,
@@ -1568,6 +1614,9 @@ impl Cx {
 
     /// `sample`, `sample_compare`, `gather` with arguments (sampler, coord, [slice], [ref], options...).
     fn sample_op(&mut self, tx: Tex, tex: Expr, name: &str, args: &[SampleArg<'_>]) -> R<Expr> {
+        if tx.kind == TexKind::T2dMs {
+            return Err(Error::unsupported(format!("method:{name}:texture2d_ms")));
+        }
         let mut it = args.iter();
         let sampler = self.sample_arg(it.next().ok_or_else(|| Error::invalid("sampler"))?)?;
         let dim = tx.kind.coord_dim();

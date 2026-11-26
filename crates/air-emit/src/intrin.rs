@@ -512,16 +512,23 @@ fn texture_op(g: &mut FnGen<'_>, tex: &Expr, tx: Tex, op: &TexOp, ret: &Type) ->
                 ty: ret.clone(),
             })
         }
-        TexOp::Read { coord, array, lod } => {
-            if kind != TexKind::T2d && kind != TexKind::T2dArray && kind != TexKind::T3d {
-                return Err(Error::unsupported(format!("read:{}", kind.name())));
-            }
-            if kind != TexKind::T2d && kind != TexKind::T2dArray {
+        TexOp::Read {
+            coord,
+            array,
+            lod,
+            sample,
+        } => {
+            if !matches!(kind, TexKind::T2d | TexKind::T2dArray | TexKind::T2dMs) {
                 return Err(Error::unsupported(format!("read:{}", kind.name())));
             }
             let c = g.expr(coord)?;
             let slice = match array {
                 Some(x) => Some(g.expr(x)?),
+                None => None,
+            };
+            let smp_idx = match sample {
+                Some(x) => Some(g.expr(x)?.r),
+                None if kind == TexKind::T2dMs => return Err(Error::invalid("read sample")),
                 None => None,
             };
             let l = match lod {
@@ -542,14 +549,19 @@ fn texture_op(g: &mut FnGen<'_>, tex: &Expr, tx: Tex, op: &TexOp, ret: &Type) ->
                 a.push(("%struct._sampler_t addrspace(2)*".into(), smp));
             }
             a.push((lt(g, &c.ty), c.r));
-            if let Some(x) = slice {
-                a.push(("i32".into(), x.r));
+            if let Some(s) = smp_idx {
+                a.push(("i32".into(), s));
+                a.push(("i32".into(), "1".into()));
+            } else {
+                if let Some(x) = slice {
+                    a.push(("i32".into(), x.r));
+                }
+                if g.cx.read_sampler {
+                    a.push(("<2 x i32>".into(), "zeroinitializer".into()));
+                }
+                a.push(("i32".into(), l));
+                a.push(("i32".into(), "0".into()));
             }
-            if g.cx.read_sampler {
-                a.push(("<2 x i32>".into(), "zeroinitializer".into()));
-            }
-            a.push(("i32".into(), l));
-            a.push(("i32".into(), "0".into()));
             let (sfx, vt) = tex_ret(tx, kind.is_depth())?;
             let st = format!("{{ {vt}, i8 }}");
             let r = call(
@@ -574,10 +586,12 @@ fn texture_op(g: &mut FnGen<'_>, tex: &Expr, tx: Tex, op: &TexOp, ret: &Type) ->
                 Query::Depth => "depth",
                 Query::ArraySize => "array_size",
                 Query::MipLevels => "num_mip_levels",
+                Query::NumSamples => "num_samples",
             };
             let t = tex_value(g, tex)?;
             let mut a = vec![(format!("{ht} nocapture readonly"), t.r)];
-            if matches!(what, Query::Width | Query::Height | Query::Depth) {
+            if kind != TexKind::T2dMs && matches!(what, Query::Width | Query::Height | Query::Depth)
+            {
                 let l = match lod {
                     Some(x) => g.expr(x)?.r,
                     None => "0".into(),

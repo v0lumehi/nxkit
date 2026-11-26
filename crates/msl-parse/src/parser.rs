@@ -132,9 +132,10 @@ fn py_split(s: &str) -> Vec<&str> {
 }
 
 const ADDR: [&str; 4] = ["device", "constant", "threadgroup", "thread"];
-const TEX_ACCEPTED: [&str; 9] = [
+const TEX_ACCEPTED: [&str; 10] = [
     "texture2d",
     "texture2d_array",
+    "texture2d_ms",
     "texture3d",
     "texturecube",
     "texturecube_array",
@@ -1208,7 +1209,11 @@ impl<'a> Parser<'a> {
         } else if tex_dim(v).is_some() {
             self.expect("<")?;
             let el = self.ident()?;
-            let mut acc = "sample";
+            let mut acc = if v == "texture2d_ms" {
+                "read"
+            } else {
+                "sample"
+            };
             if self.accept(",")? {
                 self.expect("access")?;
                 self.expect("::")?;
@@ -3055,7 +3060,12 @@ impl<'a> Parser<'a> {
                     Ok(if depth { FLOAT } else { vk(*el, 4) })
                 }
                 "write" => Ok(Ty::Void),
-                "get_width" | "get_height" | "get_depth" | "get_array_size" | "get_num_mip_levels" => Ok(UINT),
+                "get_width"
+                | "get_height"
+                | "get_depth"
+                | "get_array_size"
+                | "get_num_mip_levels"
+                | "get_num_samples" => Ok(UINT),
                 "calculate_clamped_lod" | "calculate_unclamped_lod" => {
                     if a.len() != 2 || a[0] != Ty::Sampler {
                         return reject("lod-form");

@@ -289,6 +289,8 @@ pub enum Query {
     ArraySize,
     /// `get_num_mip_levels`
     MipLevels,
+    /// `get_num_samples`
+    NumSamples,
 }
 
 /// A texture operation.
@@ -311,7 +313,7 @@ pub enum TexOp {
         /// Texel offset (intN), None for zero.
         offset: Option<Box<Expr>>,
     },
-    /// `read(coord [, slice] [, lod])`
+    /// `read(coord [, slice] [, lod])` or `read(coord, sample)` for `texture2d_ms`
     Read {
         /// uint coordinates.
         coord: Box<Expr>,
@@ -319,6 +321,8 @@ pub enum TexOp {
         array: Option<Box<Expr>>,
         /// Level (uint), None for 0.
         lod: Option<Box<Expr>>,
+        /// Sample index (uint) for `texture2d_ms`.
+        sample: Option<Box<Expr>>,
     },
     /// `write(value, coord [, slice] [, lod])`
     Write {
@@ -632,10 +636,16 @@ fn visit_expr(e: &Expr, f: &mut dyn FnMut(FuncId)) {
                         }
                     }
                 }
-                TexOp::Read { coord, array, lod } => {
+                TexOp::Read {
+                    coord,
+                    array,
+                    lod,
+                    sample,
+                } => {
                     visit_expr(coord, f);
                     opt(array, f);
                     opt(lod, f);
+                    opt(sample, f);
                 }
                 TexOp::Write {
                     value,

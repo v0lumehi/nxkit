@@ -4,6 +4,19 @@ All notable changes are in this file. The format follows Keep a Changelog. Versi
 
 ## Unreleased
 
+## 0.16.8 - 2026-11-27
+
+### Changed
+
+- `nxkit-gpu`, `nxkit-metal`: enable `NXKIT_PRIVATE=1` mirrored mode by default and remove legacy `rename`/`overlap` page tracking paths.
+- `nxkit-nvn`, `nxkit-gpu`: skip untouched render-pass attachments during liveness, barrier planning, render-pass setup, and copy-back dirty tracking; omit `Stages::VERTEX` from read barriers when a pass does not sample in vertex shaders.
+- `nxkit-gpu`: pointer-deduplicate uniform snapshot preloading, `note_rw` shader/slot checks, and bindless/fit handle scans; balance pass chunk splitting and schedule heavier chunks first.
+- `nxkit-metal`: extend `EPOCH_FRAMES` to `2048` to eliminate idle snapshot evictions across long pauses.
+
+### Fixed
+
+- `nxkit-metal`: restore carried CPU bytes byte-wise in `stage_carry`, tighten `LastGpu::changed` tracking across overlapping frames, and re-verify `SYNC` page state before instruction emulation to fix standing and camera-pan flicker under `NXKIT_PRIVATE=1`.
+
 ## 0.16.7 - 2026-11-26
 
 ### Added

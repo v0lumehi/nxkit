@@ -26,6 +26,7 @@ pub mod patchlib;
 mod pointer;
 mod prefs;
 mod present;
+pub mod rlimit;
 mod screen;
 mod stophooks;
 mod textinputui;

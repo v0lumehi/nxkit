@@ -111,6 +111,7 @@ fn check_kernel_service(mask: u64) -> Result<()> {
 
 /// Runs the game. It returns when the window or the game has stopped.
 pub fn run(opts: &Options) -> Result<()> {
+    sys::rlimit::raise_open_files();
     // The one read of the `NXKIT_*` environment (W27): every crate's typed settings come from this snapshot. The
     // crates that keep them for code with no context get them now, before any part exists. A crate that had them
     // already or was read before stops the run. The rest is passed in below. The saved choices of the player in the

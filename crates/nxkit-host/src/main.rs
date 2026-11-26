@@ -91,6 +91,7 @@ fn main() {
 
     use nxkit_host::run::Options;
 
+    nxkit_host::sys::rlimit::raise_open_files();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let filtered = filter_launch_args(&args);
     let usage = "usage: nxkit-host [--fullscreen] <run folder>\n       nxkit-host probe <run folder>\n       \

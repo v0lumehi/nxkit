@@ -202,7 +202,70 @@ std::arch::global_asm!(
     "ldr x9, [x0, #160]",
     "mov sp, x9",
     "ret",
+    // nxkit_thread_call(entry, args, sp, save) -> u64: calls `entry` on `sp` with 8 register args (`x0..x7`) and
+    // 6 stack args (`[sp+0..sp+40]`), returning `x0`.
+    ".globl _nxkit_thread_call",
+    ".p2align 2",
+    "_nxkit_thread_call:",
+    "stp x19, x20, [x3, #0]",
+    "stp x21, x22, [x3, #16]",
+    "stp x23, x24, [x3, #32]",
+    "stp x25, x26, [x3, #48]",
+    "stp x27, x28, [x3, #64]",
+    "stp x29, x30, [x3, #80]",
+    "stp d8, d9, [x3, #96]",
+    "stp d10, d11, [x3, #112]",
+    "stp d12, d13, [x3, #128]",
+    "stp d14, d15, [x3, #144]",
+    "mov x9, sp",
+    "str x9, [x3, #160]",
+    "and x9, x2, #-16",
+    "sub x9, x9, #48",
+    "mov sp, x9",
+    "mov x29, #0",
+    "ldp x10, x11, [x1, #64]",
+    "stp x10, x11, [sp, #0]",
+    "ldp x10, x11, [x1, #80]",
+    "stp x10, x11, [sp, #16]",
+    "ldp x10, x11, [x1, #96]",
+    "stp x10, x11, [sp, #32]",
+    "mov x16, x0",
+    "ldp x2, x3, [x1, #16]",
+    "ldp x4, x5, [x1, #32]",
+    "ldp x6, x7, [x1, #48]",
+    "ldp x0, x1, [x1, #0]",
+    "blr x16",
+    "bl _nxkit_thread_returned_val",
+    "brk #0",
+    // nxkit_thread_leave_val(save, ret): restores `save` and returns `ret` in `x0`.
+    ".globl _nxkit_thread_leave_val",
+    ".p2align 2",
+    "_nxkit_thread_leave_val:",
+    "ldp x19, x20, [x0, #0]",
+    "ldp x21, x22, [x0, #16]",
+    "ldp x23, x24, [x0, #32]",
+    "ldp x25, x26, [x0, #48]",
+    "ldp x27, x28, [x0, #64]",
+    "ldp x29, x30, [x0, #80]",
+    "ldp d8, d9, [x0, #96]",
+    "ldp d10, d11, [x0, #112]",
+    "ldp d12, d13, [x0, #128]",
+    "ldp d14, d15, [x0, #144]",
+    "ldr x9, [x0, #160]",
+    "mov sp, x9",
+    "mov x0, x1",
+    "ret",
 );
+
+/// Arguments for [`call`]: 8 register arguments (`x0..x7`) and 6 stack arguments (`[sp+0..sp+40]`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CallArgs {
+    /// Register arguments `x0..x7`.
+    pub x: [u64; 8],
+    /// Stack arguments `[sp+0..sp+40]`.
+    pub stack: [u64; 6],
+}
 
 unsafe extern "C" {
     #[link_name = "nxkit_gate_top"]
@@ -211,6 +274,8 @@ unsafe extern "C" {
     fn gate_stubs();
     fn nxkit_thread_enter(entry: u64, arg: u64, sp: u64, save: *mut u64, arg1: u64);
     fn nxkit_thread_leave(save: *mut u64) -> !;
+    fn nxkit_thread_call(entry: u64, args: *const CallArgs, sp: u64, save: *mut u64) -> u64;
+    fn nxkit_thread_leave_val(save: *mut u64, ret: u64) -> !;
 }
 
 /// The gates of all modules and the handlers of the observation gates.
@@ -261,6 +326,17 @@ pub fn enter(entry: u64, arg: u64, arg1: u64, sp: u64) {
     SAVE.with(|s| s.set(0));
 }
 
+/// Calls guest function `entry` on the calling thread with 8 register args and 6 stack args on `sp`, returning `x0`.
+pub fn call(entry: u64, args: &CallArgs, sp: u64) -> u64 {
+    let mut save = [0u64; SAVE_WORDS];
+    SAVE.with(|s| s.set(save.as_mut_ptr() as usize));
+    // SAFETY: `entry` is callable code at a loaded address, `args` is a valid `CallArgs`, and `save` is live until
+    // `nxkit_thread_leave_val` or `nxkit_thread_leave` returns.
+    let ret = unsafe { nxkit_thread_call(entry, args, sp, save.as_mut_ptr()) };
+    SAVE.with(|s| s.set(0));
+    ret
+}
+
 /// Runs svc `number` through the kernel with registers `regs`, at least eight. Returns what `nxkit_svc` returns:
 /// 1 when it answered, 0 when it did not.
 pub fn call_svc(number: u32, regs: &mut [u64]) -> i32 {
@@ -302,6 +378,16 @@ fn leave() -> ! {
 #[unsafe(no_mangle)]
 extern "C" fn nxkit_thread_returned() -> ! {
     leave()
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn nxkit_thread_returned_val(ret: u64) -> ! {
+    let p = SAVE.with(Cell::get);
+    if p == 0 {
+        stop::fatal("a guest thread ended outside guest code");
+    }
+    // SAFETY: `p` is the save area of the live `call` of this thread.
+    unsafe { nxkit_thread_leave_val(p as *mut u64, ret) }
 }
 
 #[unsafe(no_mangle)]
@@ -435,5 +521,49 @@ mod tests {
         assert_eq!(out[34..98], frame[32..96], "q0 to q31");
         assert_eq!(out[98], 0x0300_0000 | 0x10 << 32, "fpcr, then fpsr");
         assert_eq!(out[99], 0, "tpidr comes from the kernel");
+    }
+
+    extern "C" fn sum14(
+        a0: u64,
+        a1: u64,
+        a2: u64,
+        a3: u64,
+        a4: u64,
+        a5: u64,
+        a6: u64,
+        a7: u64,
+        s0: u64,
+        s1: u64,
+        s2: u64,
+        s3: u64,
+        s4: u64,
+        s5: u64,
+    ) -> u64 {
+        a0 + a1 * 2
+            + a2 * 3
+            + a3 * 4
+            + a4 * 5
+            + a5 * 6
+            + a6 * 7
+            + a7 * 8
+            + s0 * 9
+            + s1 * 10
+            + s2 * 11
+            + s3 * 12
+            + s4 * 13
+            + s5 * 14
+    }
+
+    #[test]
+    fn call_passes_eight_reg_and_six_stack_args_and_returns_x0() {
+        let mut stack = vec![0u64; 1024];
+        let sp = stack.as_mut_ptr() as u64 + 1024 * 8;
+        let args = CallArgs {
+            x: [1, 2, 3, 4, 5, 6, 7, 8],
+            stack: [9, 10, 11, 12, 13, 14],
+        };
+        let got = call(sum14 as *const () as usize as u64, &args, sp);
+        let want: u64 = (1..=14).map(|i| i * i).sum();
+        assert_eq!(got, want);
     }
 }

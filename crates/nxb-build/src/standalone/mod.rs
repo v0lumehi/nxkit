@@ -311,8 +311,9 @@ pub(crate) fn run(a: &Args, p: &Say) -> Result<(), String> {
         (false, true) => "packages and shader split",
         (false, false) => "packages",
     };
-    stage(p, "extract", what, || {
-        Ok(((), extract(a, &b, p, version, t.st.romfs_marker)?))
+    let deferred = stage(p, "extract", what, || {
+        let done = extract(a, &b, p, version, t.st.romfs_marker)?;
+        Ok((done.deferred, done.summary))
     })?;
     let ver_dir = work.join("extract").join(format!("v{version}"));
     let exefs = ver_dir.join("ExeFS");
@@ -522,6 +523,8 @@ pub(crate) fn run(a: &Args, p: &Say) -> Result<(), String> {
             p.say(&format!("pipeline list: {}", l.display()));
         }
     }
+    let bundled_host = stage_dir.join("Contents/MacOS/nxkit-host");
+    files::finish_deferred_split(a, &b, p, &bundled_host, &run_dir, version, deferred)?;
     stage(p, "shaders", "shaders and pipeline archive", || {
         let d = if vulkan {
             vk_shaders::run(a, &b.work, p, &run_dir)?

@@ -50,6 +50,7 @@ fn filter_launch_args(args: &[String]) -> Vec<&str> {
                 let is_value_token = !next.starts_with('-')
                     && next != "probe"
                     && next != "home-preview"
+                    && next != "oodle-serve"
                     && !next.contains('/')
                     && !std::path::Path::new(next).is_dir();
                 if is_value_token {
@@ -93,7 +94,8 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let filtered = filter_launch_args(&args);
     let usage = "usage: nxkit-host [--fullscreen] <run folder>\n       nxkit-host probe <run folder>\n       \
-         nxkit-host home-preview <folder>\n       nxkit-host --save-sync-report[=<ms>] [<run folder>]\n       \
+         nxkit-host oodle-serve <run folder>\n       nxkit-host home-preview <folder>\n       \
+         nxkit-host --save-sync-report[=<ms>] [<run folder>]\n       \
          nxkit-host --save-sync-send [<run folder>]";
     if let Some(code) = save_sync(&filtered, usage) {
         std::process::exit(code);
@@ -108,6 +110,7 @@ fn main() {
             fullscreen: true,
         }),
         ["probe", root] => nxkit_host::probe::run(&PathBuf::from(*root)),
+        ["oodle-serve", root] => nxkit_host::oodle::serve(&PathBuf::from(*root)),
         ["home-preview", dir] => match nxkit_host::sys::homepreview::run(&PathBuf::from(*dir)) {
             Ok(files) => {
                 for f in files {
@@ -124,7 +127,12 @@ fn main() {
             root: PathBuf::from(*root),
             fullscreen: true,
         }),
-        [root] if *root != "probe" && *root != "home-preview" && !root.starts_with('-') => {
+        [root]
+            if *root != "probe"
+                && *root != "home-preview"
+                && *root != "oodle-serve"
+                && !root.starts_with('-') =>
+        {
             nxkit_host::run::run(&Options {
                 root: PathBuf::from(*root),
                 fullscreen: false,

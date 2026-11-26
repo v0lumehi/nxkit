@@ -62,6 +62,9 @@ pub mod memreport;
 #[cfg(target_os = "macos")]
 pub mod obswire;
 #[cfg(target_os = "macos")]
+pub mod oodle;
+pub mod oodle_find;
+#[cfg(target_os = "macos")]
 pub mod patchctl;
 #[cfg(target_os = "macos")]
 pub mod place;

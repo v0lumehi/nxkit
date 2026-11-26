@@ -96,7 +96,7 @@ const PAK_MAGIC: u32 = 0x5A6F_12E1;
 pub(super) struct Pak {
     src: Arc<dyn Src>,
     rel: String,
-    version: u32,
+    pub(super) version: u32,
     methods: Vec<String>,
     pub(super) mount: String,
     pub(super) names: Vec<String>,

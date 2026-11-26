@@ -239,6 +239,24 @@ extern "C" fn at_exit() {
     flush();
 }
 
+/// Duplicates fd 1 for a binary protocol writer and redirects fd 1 to stderr so stray stdout output never corrupts it.
+pub fn take_protocol_stdout() -> std::io::Result<std::fs::File> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: plain descriptor calls on fd 1 and fd 2; `fd` is newly duplicated and uniquely owned by the `File`.
+    unsafe {
+        let fd = dup(1);
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if dup2(2, 1) < 0 {
+            let err = std::io::Error::last_os_error();
+            close(fd);
+            return Err(err);
+        }
+        Ok(std::fs::File::from_raw_fd(fd))
+    }
+}
+
 /// Puts the original file back in place of the pipe and waits up to two seconds until the writer wrote what was in
 /// the pipe and in memory.
 pub fn flush() {

@@ -7,6 +7,19 @@ use crate::graph::Build;
 use crate::inputs::Source;
 use std::path::{Path, PathBuf};
 
+/// Deferred shader split state when the fused extract split hit Oodle/LZ5 and must re-run with `nxkit-host`.
+pub(super) struct DeferredSplit {
+    pub(super) reason: String,
+    pub(super) key: String,
+    pub(super) key_file: PathBuf,
+}
+
+/// Output of the extract stage: summary text and an optional deferred split.
+pub(super) struct ExtractDone {
+    pub(super) summary: String,
+    pub(super) deferred: Option<DeferredSplit>,
+}
+
 /// The extract and the split, reused while the packages are as they were. Packages give `RomFS.img`, a NUP gives the
 /// RomFS as a folder (`romfs/`) and no image.
 pub(super) fn extract(
@@ -15,7 +28,7 @@ pub(super) fn extract(
     p: &Say,
     version: u32,
     marker: &str,
-) -> Result<String, String> {
+) -> Result<ExtractDone, String> {
     let dir = b.work.join("extract").join(format!("v{version}"));
     let nup = b.src.source == Source::Nup;
     let key_file = b.work.join("extract.key");
@@ -35,8 +48,8 @@ pub(super) fn extract(
         && (!b.split
             || std::fs::read_dir(b.work.join("shader/pkg")).is_ok_and(|mut d| d.next().is_some()));
     let reused = have && std::fs::read_to_string(&key_file).is_ok_and(|k| k == key);
-    let mut text = if reused {
-        "reused".to_string()
+    let (mut text, deferred) = if reused {
+        ("reused".to_string(), None)
     } else {
         let _ = std::fs::remove_file(&key_file);
         let (text, unsupported) = if nup {
@@ -46,19 +59,106 @@ pub(super) fn extract(
             (format!("{images} images"), why)
         };
         if let Some(why) = unsupported {
-            return Err(crate::exit::fail(
-                4,
-                format!("unsupported: the shader split needs the game's own decoder: {why}"),
-            ));
+            (
+                format!("{text}, shader split deferred for Mac host decoder"),
+                Some(DeferredSplit {
+                    reason: why,
+                    key,
+                    key_file,
+                }),
+            )
+        } else {
+            std::fs::write(&key_file, &key).map_err(|e| io(&key_file, e))?;
+            (text, None)
         }
-        std::fs::write(&key_file, &key).map_err(|e| io(&key_file, e))?;
-        text
     };
     if let Some(d) = crate::extract_stage::dlc(a, b, p)? {
         text.push_str(&format!(", {d}"));
     }
-    shaders::take_tables(&b.work, &b.profile.0)?;
-    Ok(text)
+    if deferred.is_none() {
+        shaders::take_tables(&b.work, &b.profile.0)?;
+    }
+    Ok(ExtractDone {
+        summary: text,
+        deferred,
+    })
+}
+
+/// Runs the deferred shader split after `nxgame.dylib` and `nxkit-host` are linked, installing `nxkit-host oodle-serve`
+/// as the Oodle/LZ5 decoder.
+pub(super) fn finish_deferred_split(
+    a: &Args,
+    b: &Build,
+    p: &Say,
+    host_bin: &Path,
+    run_dir: &Path,
+    version: u32,
+    deferred: Option<DeferredSplit>,
+) -> Result<(), String> {
+    let Some(ds) = deferred else {
+        return Ok(());
+    };
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (a, b, p, host_bin, run_dir, version);
+        return Err(crate::exit::fail(
+            4,
+            format!(
+                "unsupported: the shader split needs the game's own decoder: {}",
+                ds.reason
+            ),
+        ));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        p.say(&format!(
+            "shader split: decoding Oodle streams with the game's own decoder in nxkit-host ({})",
+            ds.reason
+        ));
+        let versions = if b.src.source == Source::Nup || b.updates.is_empty() {
+            vec![b.work.join("extract").join(format!("v{version}"))]
+        } else {
+            std::iter::once(b.work.join("extract/v0"))
+                .chain(
+                    b.updates
+                        .iter()
+                        .map(|(v, _)| b.work.join("extract").join(format!("v{v}"))),
+                )
+                .collect()
+        };
+        let spec = nxb_extract::oodle_host::HostSpec::for_run(
+            host_bin.to_path_buf(),
+            run_dir.to_path_buf(),
+            b.work.join("logs/oodle"),
+        );
+        let guard = nxb_extract::oodle_host::Installed::new(spec);
+        let req = nxb_extract::split::SplitRequest {
+            versions,
+            game_tsv: b.profile.0.join("game.tsv"),
+            outputs: crate::extract_stage::split_outputs(b),
+            threads: a.threads,
+            progress: None,
+        };
+        let res = nxb_extract::split::split(&req);
+        drop(guard);
+        match res {
+            Ok((_, bad)) => {
+                for line in bad {
+                    p.say(&line);
+                }
+            }
+            Err(nxb_extract::ExtractError::Unsupported(why)) => {
+                return Err(crate::exit::fail(
+                    4,
+                    format!("unsupported: the shader split needs the game's own decoder: {why}"),
+                ));
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+        std::fs::write(&ds.key_file, &ds.key).map_err(|e| io(&ds.key_file, e))?;
+        shaders::take_tables(&b.work, &b.profile.0)?;
+        Ok(())
+    }
 }
 
 /// Unpacks a RomFS image into `dest`, reporting the bytes.
@@ -135,4 +235,54 @@ pub(super) fn link(
             count.set_total(total);
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::{Mode, Progress};
+    use crate::inputs::Inputs;
+    use std::sync::Arc;
+
+    #[test]
+    fn finish_deferred_split_is_noop_when_none() {
+        let a = Args::default();
+        let b = Build {
+            title: "0400245021D2C000".into(),
+            base: PathBuf::new(),
+            updates: vec![],
+            package: "v131072".into(),
+            work: PathBuf::new(),
+            profile: (PathBuf::new(), Default::default()),
+            shaders: PathBuf::new(),
+            gpus: vec![],
+            split: true,
+            pipeline_lists: vec![],
+            seeds: Default::default(),
+            src: Inputs {
+                source: Source::Packages,
+                app: 0x0400_2450_21D2_C000,
+                app_flag: None,
+                base: PathBuf::new(),
+                base_version: 0,
+                has_base: true,
+                updates: vec![],
+                dlc: vec![],
+                notes: vec![],
+            },
+        };
+        let p: Say = Arc::new(Progress::new(Mode::Off, Box::new(std::io::sink())));
+        assert!(
+            finish_deferred_split(
+                &a,
+                &b,
+                &p,
+                Path::new("nxkit-host"),
+                Path::new("run"),
+                0,
+                None
+            )
+            .is_ok()
+        );
+    }
 }

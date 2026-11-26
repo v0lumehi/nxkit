@@ -122,10 +122,8 @@ impl Boot {
         gate::enter(f.addr, x0, x1, sp);
     }
 
-    /// Runs the boot and `nnMain` on the calling host thread, which must be the attached main guest thread with its
-    /// thread slots set up. `main_handle` is the kernel handle of the thread. `sp` is the top of the main stack, and
-    /// every call starts there, because the call before it has returned.
-    pub fn run(&self, main_handle: u32, sp: u64) {
+    /// Runs the SDK initialization and each module's `DT_INIT` on the calling guest thread without entering `nnMain`.
+    pub fn init(&self, main_handle: u32, sp: u64) {
         Self::call(self.libc0, 0, 0, sp);
         Self::call(self.os_initialize, u64::from(main_handle), 0, sp);
         Self::call(self.libc1, 0, 0, sp);
@@ -138,6 +136,13 @@ impl Boot {
             eprintln!(">>> DT_INIT {} +{:#x}", i.module, i.offset);
             gate::enter(i.addr, 0, 0, sp);
         }
+    }
+
+    /// Runs the boot and `nnMain` on the calling host thread, which must be the attached main guest thread with its
+    /// thread slots set up. `main_handle` is the kernel handle of the thread. `sp` is the top of the main stack, and
+    /// every call starts there, because the call before it has returned.
+    pub fn run(&self, main_handle: u32, sp: u64) {
+        self.init(main_handle, sp);
         Self::call(self.nn_main, 0, 0, sp);
         eprintln!("nnMain returned");
     }

@@ -382,6 +382,14 @@ impl Templates {
 
 /// Runs the split on extracted version directories, returns the outputs and the `[RED]` lines of unreadable files.
 pub fn split(req: &SplitRequest) -> Result<(Outputs, Vec<String>)> {
+    if !req.versions.is_empty()
+        && req
+            .versions
+            .iter()
+            .all(|v| !v.join("RomFS.img").is_file() && v.join("romfs").is_dir())
+    {
+        return crate::split_dir::split_loose(req);
+    }
     let mut t = Templates::new(&req.game_tsv)?;
     let mut versions = Vec::new();
     let mut jobs: Vec<(usize, String, u64, u64)> = Vec::new();

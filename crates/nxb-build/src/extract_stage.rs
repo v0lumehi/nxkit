@@ -10,7 +10,7 @@ use crate::events::{Progress, Update};
 use crate::graph::Build;
 use crate::inputs::Source;
 
-fn split_outputs(b: &Build) -> nxb_extract::split::SplitOutputs {
+pub(crate) fn split_outputs(b: &Build) -> nxb_extract::split::SplitOutputs {
     nxb_extract::split::SplitOutputs {
         pkg: b.work.join("shader/pkg"),
         map: b.work.join("shader/shader_map.tsv"),

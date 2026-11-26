@@ -12,9 +12,31 @@ use crate::SplitError;
 use crate::bahs::BahsVar;
 use crate::src::Src;
 
+/// Whether a pak entry can hold inline Switch shader records (`LSLG`).
+///
+/// UE 4.15+ cooked assets (EDL) split exports into `.uexp`, and global inline shaders live in
+/// `GlobalShaderCache-*`. Skipping non-shader assets (such as ICU `.dict`, `.locres`, `.ini`,
+/// `.ubulk`, or `.uasset` when `.uexp` / UE5 IoStore is present) avoids needlessly decompressing
+/// non-shader entries (for example Oodle-compressed `.dict` files in UE5 paks).
+fn may_hold_inline_shaders(name: &str, allow_uasset: bool) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let base = name.rsplit('/').next().unwrap_or(name);
+    lower.ends_with(".uexp")
+        || base.starts_with("GlobalShaderCache-")
+        || (allow_uasset && (lower.ends_with(".uasset") || lower.ends_with(".umap")))
+}
+
 fn legacy_shaders(pk: &Pak, rel: &str, names: &[String]) -> R<JobOut> {
+    let allow_uasset = pk.version < 11
+        && !pk
+            .names
+            .iter()
+            .any(|n| n.to_ascii_lowercase().ends_with(".uexp"));
     let mut out = Vec::new();
     for name in names {
+        if !may_hold_inline_shaders(name, allow_uasset) {
+            continue;
+        }
         let d = pk.read(name)?;
         let n = normpath(&format!("{}{}", pk.mount, name));
         let label = n.trim_start_matches("../");
@@ -212,4 +234,187 @@ pub fn plan(files: &[File], p: &mut Plan) -> R<()> {
     }
     flush(&mut cur, &mut order, p);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jobs::own;
+    use crate::oodle::{Answer, Decoder, set_local_decoder};
+    use crate::zstd::Dicts;
+
+    fn fstr(out: &mut Vec<u8>, s: &str) {
+        out.extend((s.len() as i32 + 1).to_le_bytes());
+        out.extend_from_slice(s.as_bytes());
+        out.push(0);
+    }
+
+    /// Builds a minimal v11 pak with method 1 = `"Oodle"`. Each entry is `(dir, file, oodle, data)`.
+    fn build_v11_pak(entries: &[(&str, &str, bool, &[u8])]) -> Vec<u8> {
+        let mut pak = Vec::new();
+        let mut enc_blob = Vec::new();
+        let mut by_dir: BTreeMap<&str, Vec<(&str, u32)>> = BTreeMap::new();
+        for &(dir, file, oodle, data) in entries {
+            let off = pak.len() as u32;
+            pak.extend_from_slice(&[0u8; 53]);
+            if oodle {
+                pak.extend_from_slice(&1u32.to_le_bytes());
+                pak.extend_from_slice(&[0u8; 16]);
+            }
+            pak.extend_from_slice(data);
+            let at = enc_blob.len() as u32;
+            if oodle {
+                let v = (1u32 << 31) | (1 << 30) | (1 << 29) | (1 << 23) | (1 << 6) | 1;
+                enc_blob.extend_from_slice(&v.to_le_bytes());
+                enc_blob.extend_from_slice(&off.to_le_bytes());
+                enc_blob.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                enc_blob.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                enc_blob.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            } else {
+                let v = (1u32 << 31) | (1 << 30);
+                enc_blob.extend_from_slice(&v.to_le_bytes());
+                enc_blob.extend_from_slice(&off.to_le_bytes());
+                enc_blob.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            }
+            by_dir.entry(dir).or_default().push((file, at));
+        }
+        let doff = pak.len() as u64;
+        let mut dir_idx = Vec::new();
+        dir_idx.extend_from_slice(&(by_dir.len() as i32).to_le_bytes());
+        for (dir, files) in by_dir {
+            fstr(&mut dir_idx, dir);
+            dir_idx.extend_from_slice(&(files.len() as i32).to_le_bytes());
+            for (file, at) in files {
+                fstr(&mut dir_idx, file);
+                dir_idx.extend_from_slice(&at.to_le_bytes());
+            }
+        }
+        let dsz = dir_idx.len() as u64;
+        pak.extend_from_slice(&dir_idx);
+        let ioff = pak.len() as u64;
+        let mut idx = Vec::new();
+        fstr(&mut idx, "../../../");
+        idx.extend_from_slice(&0i32.to_le_bytes());
+        idx.extend_from_slice(&0u64.to_le_bytes());
+        idx.extend_from_slice(&0i32.to_le_bytes());
+        idx.extend_from_slice(&1i32.to_le_bytes());
+        idx.extend_from_slice(&doff.to_le_bytes());
+        idx.extend_from_slice(&dsz.to_le_bytes());
+        idx.extend_from_slice(&[0u8; 20]);
+        idx.extend_from_slice(&(enc_blob.len() as i32).to_le_bytes());
+        idx.extend_from_slice(&enc_blob);
+        idx.extend_from_slice(&0i32.to_le_bytes());
+        let isz = idx.len() as u64;
+        pak.extend_from_slice(&idx);
+        let mut ft = vec![0u8; 0xcc + 21];
+        let k = 21usize;
+        ft[k..k + 4].copy_from_slice(&0x5A6F_12E1u32.to_le_bytes());
+        ft[k + 4..k + 8].copy_from_slice(&11u32.to_le_bytes());
+        ft[k + 8..k + 16].copy_from_slice(&ioff.to_le_bytes());
+        ft[k + 16..k + 24].copy_from_slice(&isz.to_le_bytes());
+        ft[k + 44..k + 49].copy_from_slice(b"Oodle");
+        pak.extend_from_slice(&ft);
+        pak
+    }
+
+    #[test]
+    fn inline_shader_entry_filter_skips_non_shader_assets() {
+        assert!(may_hold_inline_shaders("Game/Content/M.uexp", false));
+        assert!(may_hold_inline_shaders("Game/Content/M.UEXP", false));
+        assert!(may_hold_inline_shaders(
+            "Engine/GlobalShaderCache-SF_SWITCH_2.bin",
+            false
+        ));
+        assert!(!may_hold_inline_shaders(
+            "Engine/Content/Internationalization/icudt64l/brkitr/laodict.dict",
+            false
+        ));
+        assert!(!may_hold_inline_shaders("Game/Content/M.uasset", false));
+        assert!(may_hold_inline_shaders("Game/Content/M.uasset", true));
+        assert!(may_hold_inline_shaders("Game/Content/Map.umap", true));
+    }
+
+    #[test]
+    fn oodle_non_shader_entries_do_not_trigger_oodle_decode() {
+        set_local_decoder(Some(None));
+        let pak = build_v11_pak(&[
+            (
+                "Engine/Content/Internationalization/icudt64l/brkitr/",
+                "laodict.dict",
+                true,
+                b"oodle-dict-bytes",
+            ),
+            ("Game/Content/", "M.uexp", false, b"no-shaders-here"),
+            ("Game/Content/", "M.uasset", true, b"oodle-uasset"),
+        ]);
+        let files = vec![File {
+            rel: "PJ045/Content/Paks/PJ045-Sage.pak".into(),
+            src: own(pak),
+            live: true,
+        }];
+        let mut p = Plan::default();
+        plan(&files, &mut p).expect("plan");
+        assert!(!p.jobs.is_empty());
+        let dicts = Dicts::new();
+        let ctx = Ctx {
+            files: &files,
+            dicts: &dicts,
+        };
+        for j in &p.jobs {
+            let out = (j.run)(&ctx, &mut Vec::new()).expect("non-shader Oodle entries skipped");
+            assert!(out.found.is_empty());
+        }
+        set_local_decoder(None);
+    }
+
+    #[test]
+    fn oodle_shader_cache_still_requires_decoder() {
+        set_local_decoder(Some(None));
+        let pak = build_v11_pak(&[
+            ("Game/Content/", "M.uexp", false, b"plain"),
+            (
+                "Engine/",
+                "GlobalShaderCache-SF_SWITCH_2.bin",
+                true,
+                b"compressed-global",
+            ),
+        ]);
+        let files = vec![File {
+            rel: "PJ045/Content/Paks/PJ045-Sage.pak".into(),
+            src: own(pak),
+            live: true,
+        }];
+        let mut p = Plan::default();
+        plan(&files, &mut p).expect("plan");
+        let dicts = Dicts::new();
+        let ctx = Ctx {
+            files: &files,
+            dicts: &dicts,
+        };
+        let errs: Vec<_> = p
+            .jobs
+            .iter()
+            .filter_map(|j| (j.run)(&ctx, &mut Vec::new()).err())
+            .collect();
+        assert!(
+            errs.iter().any(|e| matches!(e, SplitError::Unsupported(_))),
+            "{errs:?}"
+        );
+
+        struct Copy;
+        impl Decoder for Copy {
+            fn ask(&self, comp: &[u8], n: usize) -> Answer {
+                assert_eq!(comp.len(), n);
+                Answer::Bytes(comp.to_vec())
+            }
+            fn said(&self) -> String {
+                String::new()
+            }
+        }
+        set_local_decoder(Some(Some(Arc::new(Copy))));
+        for j in &p.jobs {
+            (j.run)(&ctx, &mut Vec::new()).expect("decodes with local decoder");
+        }
+        set_local_decoder(None);
+    }
 }

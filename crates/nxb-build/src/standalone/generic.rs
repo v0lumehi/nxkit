@@ -176,6 +176,16 @@ pub(super) fn run(a: &Args, p: &Say) -> Result<(), String> {
             }
             let romfs_fallback = run.join("romfs");
             let romfs_dir = game.romfs_dir.as_deref().unwrap_or(&romfs_fallback);
+            let oodle_logs = crate::host::TempDir::new_in(
+                a.work_dir.as_deref().unwrap_or(&std::env::temp_dir()),
+            )?;
+            let _oodle = cfg!(target_os = "macos").then(|| {
+                nxb_extract::oodle_host::Installed::new(nxb_extract::oodle_host::HostSpec::for_run(
+                    partial.join("Contents/MacOS/nxkit-host"),
+                    run.clone(),
+                    oodle_logs.path().to_path_buf(),
+                ))
+            });
             let count = auto_shaders::discover_dir(
                 &game.modules,
                 romfs_dir,

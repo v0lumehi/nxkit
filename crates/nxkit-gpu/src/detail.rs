@@ -509,12 +509,6 @@ pub struct FrameDetail {
     /// The timestamp reports (`nvnCommandBufferReportCounter`) and value reports (`nvnCommandBufferReportValue`) of the
     /// frame, in command order.
     pub reports: Vec<CounterReport>,
-    /// The storage ranges that this frame reads and writes from a copy of its own (`rename`), taken at the flush. Only
-    /// with the overlap on.
-    pub(crate) rename: Option<Arc<Capture>>,
-    /// The storage bindings of the frame whose use (written or only read) the encoder has to look at; `None` means all of
-    /// them. The flush places the others (`rename`).
-    pub(crate) rename_check: Option<Vec<(u8, u32, u32)>>,
 }
 
 /// The [`CounterReport::kind`] of `nvnCommandBufferReportValue`: the counter is [`CounterReport::value`].
@@ -548,9 +542,6 @@ impl CounterReport {
         matches!(self.kind, REPORT_EVENT_WRITE | REPORT_EVENT_ADD)
     }
 }
-
-mod capture;
-pub(crate) use capture::{CapRange, Capture, Kind};
 
 /// The most draws of one multi-draw that the pre-pass copies. The rest are left out and counted.
 pub(crate) const MAX_MULTI: u32 = 4096;

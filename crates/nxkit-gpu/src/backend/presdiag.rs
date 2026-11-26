@@ -3,7 +3,7 @@
 //! - `present`: the counters of the ticks, the presents asked, the textures found and the blits done.
 //! - `encpace`: for every 60th frame, the time from the game's present to the end of its encode and from there to the
 //!   tick that shows it, to see where a deeper pipeline loses time.
-//! - `overlap` and `stats`: whether the backend prints those counters.
+//! - `stats`: whether the backend prints those counters.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -41,11 +41,6 @@ impl PresentDiag {
     /// `NXKIT_DIAG=encpace`.
     fn encpace(&self) -> bool {
         crate::diag("encpace")
-    }
-
-    /// `NXKIT_DIAG=overlap`.
-    pub(super) fn overlap(&self) -> bool {
-        crate::diag("overlap")
     }
 
     /// `NXKIT_DIAG=stats`.

@@ -177,10 +177,6 @@ fn hash_draw(sh: &Shared<'_>, d: &DrawDetail, h: &mut impl Hasher) {
     d.streams.hash(h);
     d.args.hash(h);
     d.ubos.hash(h);
-    // A renamed range reads the copy of the batch slot, whose address differs from frame to frame.
-    for s in &d.sbufs {
-        sh.env.rename.resolve(s.address, s.size).hash(h);
-    }
     // A range in the mirror has the address of its run's buffer, which is another one when the run grew.
     if sh.pools.overlay().is_some() {
         let real = |a: u64| sh.pools.resolve_start(a).ok().map(|l| (l.run, l.real));

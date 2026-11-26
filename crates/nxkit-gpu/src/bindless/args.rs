@@ -37,8 +37,6 @@ pub(crate) struct Env<'a> {
     /// The raw global memory table and logs.
     pub(crate) gmem: crate::gmem::GmemEnv<'a>,
     pub(crate) pools: (u64, u64),
-    /// The storage ranges that this frame reads from a copy of its own (`rename`).
-    pub(crate) rename: &'a crate::rename::RenameMap,
     /// The memory pools at the flush of the frame.
     pub(crate) guest_pools: &'a crate::guestpools::GuestPools,
     pub(crate) default_sampler: u64,
@@ -229,12 +227,11 @@ fn ubo_words<B: Backing>(
     Ok(())
 }
 
-/// The word of a storage buffer. One that is not bound reads zeros, and its writes land in the zero buffer. A range that
-/// the frame renamed reads and writes its copy (`rename`). A buffer that the shader only reads takes the walk's copy when there is one (the overlap: the CPU may already write the
-/// next frame's data). A buffer that the shader may write keeps the buffer itself, so the writes stay.
+/// The word of a storage buffer. One that is not bound reads zeros, and its writes land in the zero buffer. A buffer
+/// that the shader only reads takes the walk's copy when there is one (the CPU may already write the next frame's
+/// data). A buffer that the shader may write keeps the buffer itself, so the writes stay.
 fn sbuf_word<B: Backing>(
     pools: &PoolSnapshot<B>,
-    rename: &crate::rename::RenameMap,
     bound: Option<&UboDetail>,
     rw: bool,
     zero: u64,
@@ -243,10 +240,6 @@ fn sbuf_word<B: Backing>(
     let Some(s) = bound else {
         return Ok(zero);
     };
-    // A range that the frame renamed reads its copy, read-only or not: the copy holds what the CPU wrote at the flush.
-    if let Some(real) = rename.resolve(s.address, s.size) {
-        return Ok(real);
-    }
     match &s.snapshot {
         Some(bytes) if !rw => put(bytes),
         _ => Ok(
@@ -426,7 +419,6 @@ fn build_args_in(
                 .unwrap_or(env.statics.1),
             BindKind::Sbuf => sbuf_word(
                 env.guest_pools,
-                env.rename,
                 inp.sbufs
                     .iter()
                     .find(|s| s.stage == inp.stage && s.slot == b.reg),

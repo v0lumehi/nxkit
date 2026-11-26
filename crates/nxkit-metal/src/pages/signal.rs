@@ -203,6 +203,10 @@ pub fn name_pc(pc: u64) -> String {
     format!("{pc:#x}")
 }
 
+/// `SM_PRIVATE_ALIASED` (`<mach/vm_region.h>`): a touched private region split by `mprotect`, which XNU promotes in place
+/// to a shared COW object on `mach_vm_remap(..., copy = 0)`.
+const SM_PRIVATE_ALIASED: u8 = 6;
+
 /// Makes a second mapping of `[base, base + len)` with read and write access that shares the pages of the first (the
 /// pages are the same VM object, so a store through one is a store through the other, and the protection of the two
 /// mappings is independent). Every VM region of the range is mapped by itself, so holes and regions without write
@@ -264,10 +268,16 @@ pub(super) fn build_alias(base: u64, len: u64) -> Result<u64, String> {
         if !ok {
             continue;
         }
-        // The first mapping must be the same object after the call (a copy would leave the GPU on the old pages). A region
-        // that was never touched has no object yet (id 0): the call makes one, and no page can be under the GPU.
-        let after = crate::vmregion::vm_region(s).map(|r| (r.object, r.offset_of(s)));
-        if before.0 != 0 && after != Some(before) {
+        // Both mappings must land on the same VM object and offset. A touched split private region (`SM_PRIVATE_ALIASED`)
+        // promotes in place to a shared COW object id while keeping the same physical pages underneath.
+        let after_src = crate::vmregion::vm_region(s).map(|reg| (reg.object, reg.offset_of(s)));
+        let after_dst = crate::vmregion::vm_region(t).map(|reg| (reg.object, reg.offset_of(t)));
+        if after_src.is_none() || after_src != after_dst {
+            // SAFETY: the reservation made above.
+            unsafe { munmap(target as *mut c_void, len as usize) };
+            return Err("the remap did not share the guest VM object".to_string());
+        }
+        if before.0 != 0 && r.share_mode != SM_PRIVATE_ALIASED && after_src != Some(before) {
             // SAFETY: the reservation made above.
             unsafe { munmap(target as *mut c_void, len as usize) };
             return Err("the remap moved the guest pages to another VM object".to_string());

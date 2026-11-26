@@ -26,7 +26,6 @@ const TYPED: &[&str] = &[
     "present_snap",
     "pso_mtl4",
     "enc_thread",
-    "overlap",
     "rec_lock",
     "pace_profile",
     "rendercond_stale",
@@ -88,8 +87,6 @@ pub struct Settings {
     pub pso_mtl4: bool,
     /// Whether the encoder runs on its own thread.
     pub enc_thread: bool,
-    /// Whether the CPU runs one frame ahead of the GPU. Absent in an older `game.json`: off.
-    pub overlap: bool,
     /// Whether the end of each recording takes the lock of the front end (`rec_lock`). Absent in an older `game.json`:
     /// on. `NXKIT_REC_LOCK` wins.
     pub rec_lock: bool,
@@ -245,7 +242,6 @@ impl Settings {
             present_snap: flag(v, "present_snap")?,
             pso_mtl4: flag(v, "pso_mtl4")?,
             enc_thread: flag(v, "enc_thread")?,
-            overlap: v.get("overlap").and_then(Value::as_bool).unwrap_or(false),
             rec_lock: v.get("rec_lock").and_then(Value::as_bool).unwrap_or(true),
             pace_profile: match v.get("pace_profile").and_then(Value::as_str) {
                 None | Some("hold") => "hold".to_string(),

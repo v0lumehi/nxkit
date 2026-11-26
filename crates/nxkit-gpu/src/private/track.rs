@@ -113,10 +113,10 @@ pub(crate) fn note_rw(detail: &FrameDetail, programs: &Programs) {
             rw.known.insert((prog, slot_stage), written);
         }
     };
-    // Draws that share their programs bind the same slots: one look at each pair of programs is enough.
-    let mut seen = vec![(0usize, 0usize); 1024];
+    // Draws that share their programs bind the same slots: one look at each tuple of programs is enough.
+    let mut seen = vec![(0usize, 0usize, 0usize, 0usize); 1024];
     for d in &detail.draws {
-        if d.args.is_mesh() || d.sbufs.is_empty() {
+        if d.sbufs.is_empty() {
             continue;
         }
         let v = Arc::as_ptr(&d.program.vertex).cast::<u8>() as usize;
@@ -125,11 +125,21 @@ pub(crate) fn note_rw(detail: &FrameDetail, programs: &Programs) {
             .fragment
             .as_ref()
             .map_or(0, |f| Arc::as_ptr(f).cast::<u8>() as usize);
-        let at = (v >> 4 ^ f >> 5) & 1023;
-        if seen[at] == (v, f) {
+        let t = d
+            .program
+            .task
+            .as_ref()
+            .map_or(0, |t| Arc::as_ptr(t).cast::<u8>() as usize);
+        let m = d
+            .program
+            .mesh
+            .as_ref()
+            .map_or(0, |m| Arc::as_ptr(m).cast::<u8>() as usize);
+        let at = ((v >> 4) ^ (f >> 5) ^ (t >> 6) ^ (m >> 7)) & 1023;
+        if seen[at] == (v, f, t, m) {
             continue;
         }
-        seen[at] = (v, f);
+        seen[at] = (v, f, t, m);
         for s in &d.sbufs {
             let slot_stage = s.slot | (s.stage as u32) << 24;
             match s.stage {
@@ -139,6 +149,18 @@ pub(crate) fn note_rw(detail: &FrameDetail, programs: &Programs) {
                 }
                 Stage::Fragment => {
                     if let Some(k) = &d.program.fragment {
+                        let h = rw.hash_of(k);
+                        learn(rw, h, k, false, s.slot, slot_stage);
+                    }
+                }
+                Stage::Task => {
+                    if let Some(k) = &d.program.task {
+                        let h = rw.hash_of(k);
+                        learn(rw, h, k, false, s.slot, slot_stage);
+                    }
+                }
+                Stage::Mesh => {
+                    if let Some(k) = &d.program.mesh {
                         let h = rw.hash_of(k);
                         learn(rw, h, k, false, s.slot, slot_stage);
                     }
@@ -244,16 +266,13 @@ pub(super) fn written_in(
             continue;
         }
         prev_ptr = ptr;
-        let mesh = d.args.is_mesh();
         for s in &d.sbufs {
-            let prog = if mesh {
-                None
-            } else {
-                match s.stage {
-                    Stage::Vertex => hash(&d.program.vertex),
-                    Stage::Fragment => d.program.fragment.as_ref().and_then(hash),
-                    _ => None,
-                }
+            let prog = match s.stage {
+                Stage::Vertex => hash(&d.program.vertex),
+                Stage::Fragment => d.program.fragment.as_ref().and_then(hash),
+                Stage::Task => d.program.task.as_ref().and_then(hash),
+                Stage::Mesh => d.program.mesh.as_ref().and_then(hash),
+                _ => None,
             };
             add(s, prog);
         }

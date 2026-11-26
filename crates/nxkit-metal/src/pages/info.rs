@@ -29,6 +29,12 @@ impl PageInfo {
         }
     }
 
+    pub(super) fn set_stale(&self, m: &Mask) {
+        for (a, &b) in self.stale.iter().zip(m) {
+            a.store(b, Ordering::Release);
+        }
+    }
+
     pub(super) fn clear(&self) {
         for a in &self.stale {
             a.store(0, Ordering::Release);
@@ -42,6 +48,7 @@ impl PageInfo {
             .store(SnapWhy::Released as u32, Ordering::Relaxed);
         self.hold_frame.store(0, Ordering::Release);
         self.own_frame.store(0, Ordering::Release);
+        self.late_writer.store(0, Ordering::Release);
         for a in self.own.iter().chain(&self.hold) {
             a.store(0, Ordering::Release);
         }

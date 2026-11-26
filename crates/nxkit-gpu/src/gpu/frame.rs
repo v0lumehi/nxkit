@@ -145,15 +145,6 @@ impl Gpu {
         // `NXKIT_PRIVATE=track`: what the programs write and which pools shaders wrote.
         crate::private::note_rw(detail, &self.programs);
         crate::private::note_learned(self.gmem.learned());
-        // The storage ranges that this frame reads from a copy of its own (the overlap, `rename`). The slot's earlier
-        // frame is written back first.
-        let (rename_map, rename_buf, merges, indirect_snaps) =
-            self.rename_begin(detail, pools, region);
-        let merge_table = if merges.is_empty() {
-            None
-        } else {
-            nxkit_metal::ArgumentTable::new(&self.ctx, 31, 0).ok()
-        };
         let gmem_buf = self.gmem.refresh(&self.ctx, pools);
         self.gmem.logs().begin(region, self.gmem.ranges());
         let gmem_logs = self.gmem.logs().clone();
@@ -249,8 +240,7 @@ impl Gpu {
             // Every write of the frame to the pool tables is done (`pool_prepare`, `resolve_handles`, `pool_release`,
             // the images). The ring waited for the batch that used `region` before, so no frame reads its copy.
             self.bindless.sync(region);
-            let mut tables = self.bindless.pool_buffers(region);
-            tables.extend(rename_buf);
+            let tables = self.bindless.pool_buffers(region);
             let mut all: Vec<Texture> = textures.values().map(|r| r.tex.clone()).collect();
             all.extend(handles.keep);
             Arc::new((all, tables, gmem_buf.clone(), pools.clone()))
@@ -348,25 +338,6 @@ impl Gpu {
             detail.runs.iter().map(|r| (r.first_draw, *r)).collect();
         let preloaded = preload::finish(preload);
         mark(t0, "preload");
-        // The merge ranges are filled from guest memory on the GPU before the first pass of the frame.
-        let t_merge = crate::diag("rename").then(Instant::now);
-        if let Some(table) = &merge_table
-            && !ends.is_empty()
-            && crate::rename::merge_encode(
-                &self.pipelines,
-                first,
-                table,
-                &scratch,
-                &merges,
-                crate::rename::Phase::In,
-            )
-            .is_err()
-        {
-            stats.skip(Skip::Encode);
-        }
-        if let Some(t) = t_merge {
-            self.rename.cost_add(7, nanos(t, Instant::now()));
-        }
         let uploaded = Mutex::new(FastMap::default());
         let prof = if crate::passprof::on() {
             crate::passprof::begin_frame(&self.ctx, plan, |i| {
@@ -394,7 +365,6 @@ impl Gpu {
                     logs: Some((&*gmem_logs, region)),
                 },
                 pools: self.bindless.pools(region),
-                rename: &rename_map,
                 guest_pools: pools,
                 default_sampler: self.bindless.default_sampler_id(),
                 samplers: self.bindless.sampler_table(),
@@ -411,7 +381,6 @@ impl Gpu {
             scale,
             uploaded: &uploaded,
             preloaded: &preloaded,
-            indirect_snaps: &indirect_snaps,
         };
         let tupscale = self.tupscale.as_ref().and_then(|t| t.prepare(&shared));
         let sh = crate::encode::EncodeCtx {
@@ -493,24 +462,6 @@ impl Gpu {
             _ => Default::default(),
         };
 
-        // And their words that the GPU wrote go back into guest memory after the last pass.
-        let t_merge = crate::diag("rename").then(Instant::now);
-        if let (Some(table), Some(cb)) = (&merge_table, rest.last_mut())
-            && crate::rename::merge_encode(
-                &self.pipelines,
-                cb,
-                table,
-                &scratch,
-                &merges,
-                crate::rename::Phase::Out,
-            )
-            .is_err()
-        {
-            stats.skip(Skip::Encode);
-        }
-        if let Some(t) = t_merge {
-            self.rename.cost_add(7, nanos(t, Instant::now()));
-        }
         if let Some(p) = prof {
             crate::passprof::end_frame(p);
         }
@@ -538,7 +489,7 @@ impl Gpu {
             p[3] = nanos(t_submit, Instant::now());
         });
         let number = submitted.number();
-        self.older = self.last.replace(submitted);
+        self.last = Some(submitted);
         self.copyback.submitted(number, &mirrored_ranges);
         let waited = if lum || scan || capture {
             self.wait().ok().flatten()

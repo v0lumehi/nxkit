@@ -86,7 +86,6 @@ pub fn gpu_settings(
         batch_hooks: nxkit_rt::nvn::batch_hooks(),
         screen: screen.clone(),
         enc_thread: settings.enc_thread,
-        overlap: settings.overlap,
         // The runtime pipeline cache: what this run compiles is kept for the next start (`crate::pipecache`).
         runtime_cache: crate::pipecache::folder(root, &run.host),
         build_id: crate::pipecache::build_id(root),

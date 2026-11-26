@@ -78,10 +78,14 @@ impl Pages {
             c.masks.clear();
             c.late_copies.clear();
             c.carry.clear();
+            c.last_gpu.clear();
             c.snap = None;
             c.streak = vec![0; n];
             c.prev_dirty.clear();
             c.hot.clear();
+            c.emu_streak = vec![0; n];
+            c.prev_emu.clear();
+            c.rw_open.clear();
         }
         install_handler();
         nxkit_abi::guest::set_guard_hook(hook);
@@ -218,6 +222,23 @@ impl Pages {
     /// frames up to it may be used again).
     pub fn settled(&self) -> u64 {
         SHARED.settled.load(Ordering::Acquire)
+    }
+
+    /// Waits until [`settled`](Self::settled) reaches `frame` (so the completion handler's copy-back has finished).
+    pub fn wait_settled(&self, frame: u64) {
+        if !self.attached() || SHARED.settled.load(Ordering::Acquire) >= frame {
+            return;
+        }
+        let t0 = now_ns();
+        loop {
+            let seen = SHARED.wake.load(Ordering::Acquire);
+            if SHARED.settled.load(Ordering::Acquire) >= frame
+                || now_ns().saturating_sub(t0) > TIMEOUT_NS
+            {
+                return;
+            }
+            sleep_on_wake(seen);
+        }
     }
 
     /// Whether the flush leaves the pages with a snapshot readable while a frame in flight writes them (needs

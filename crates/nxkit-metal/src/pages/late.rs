@@ -62,6 +62,33 @@ fn revoke_read(pg: usize, w: &AtomicU32, cur: u32) {
     }
 }
 
+/// Adds frame `(runs, masks)` stale block bits for page `pg` into `out` when `pg` lies in `runs`.
+pub(super) fn or_frame_stale(
+    pg: u32,
+    runs: &[(u32, u32)],
+    masks: Option<&[Vec<Mask>]>,
+    out: &mut Mask,
+) {
+    let ri = runs.partition_point(|&(_, e)| e <= pg);
+    let Some(&(s, e)) = runs.get(ri) else {
+        return;
+    };
+    if pg < s || pg >= e {
+        return;
+    }
+    match masks
+        .and_then(|m| m.get(ri))
+        .and_then(|r| r.get((pg - s) as usize))
+    {
+        Some(m) => {
+            for k in 0..4 {
+                out[k] |= m[k];
+            }
+        }
+        None => *out = [u64::MAX; 4],
+    }
+}
+
 /// Results one frame late, at the completion of `frame` (the caller holds the control mutex): the pages of the frame's
 /// `runs` whose guest bytes are the last completed frame's get the blocks that `frame` wrote copied into guest memory
 /// through the alias, so that guest memory is the bytes of `frame` for the readers of the frame that runs now (a newer
@@ -78,12 +105,16 @@ fn revoke_read(pg: usize, w: &AtomicU32, cur: u32) {
 /// its end differ): then the frame's bytes win in guest memory, as for any result read late. The CPU's bytes of such a
 /// block reach the mirror all the same: a flush staged them already (`hold`), or they are kept aside in `carry` and the
 /// next flush stages them (`own`).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn late_copy_back(
     frame: u64,
     runs: &[(u32, u32)],
     masks: Option<&[Vec<Mask>]>,
     copies: Option<&LateCopy>,
+    still_stale_for: &mut dyn FnMut(u32) -> Mask,
     carry: &mut BTreeMap<u32, Carry>,
+    rw_open: &mut BTreeMap<u32, Hot>,
+    last_gpu: &mut BTreeMap<u32, LastGpu>,
     mirror: u64,
     alias: u64,
 ) {
@@ -100,6 +131,7 @@ pub(super) fn late_copy_back(
             if matches!(state, SYNC | OPEN) {
                 // A thread copies or reads the page right now: its bytes are no longer the last completed frame's.
                 i.snap_reset(SnapWhy::Busy);
+                last_gpu.remove(&pg);
                 continue;
             }
             let tag = u64::from(cur >> FRAME_SHIFT);
@@ -122,12 +154,16 @@ pub(super) fn late_copy_back(
                     SnapWhy::Idle
                 };
                 i.snap_reset(why);
+                last_gpu.remove(&pg);
+                rw_open::on_revoke(pg, i, rw_open);
                 revoke_read(pg as usize, w, cur);
                 continue;
             };
             let at = copies.and_then(|c| c.of(pg));
             if at.is_none() && !newest {
                 i.snap_reset(SnapWhy::NoCopy);
+                last_gpu.remove(&pg);
+                rw_open::on_revoke(pg, i, rw_open);
                 revoke_read(pg as usize, w, cur);
                 continue;
             }
@@ -138,15 +174,19 @@ pub(super) fn late_copy_back(
                 .is_err()
             {
                 i.snap_reset(SnapWhy::Busy);
+                last_gpu.remove(&pg);
+                rw_open::on_revoke(pg, i, rw_open);
                 continue;
             }
-            let keep = i.keep(f);
             let guest = alias + u64::from(pg) * p;
+            rw_open::check_late_copy(pg, i, m, guest, rw_open);
+            let keep = i.keep(f);
             let mut copy: Mask = std::array::from_fn(|k| m[k] & !keep[k]);
+            let mut changed_now: Mask = [0; 4];
+            let mut frame_won: Mask = [0; 4];
             let src = match at {
                 Some((start, end_at)) => {
-                    let mut won: Mask = [0; 4];
-                    for b in (0..blocks).filter(|&b| has(m, b) && has(&keep, b)) {
+                    for b in (0..blocks).filter(|&b| has(m, b)) {
                         let o = b as u64 * BLOCK;
                         // SAFETY: both copies hold a whole page for `pg`. The GPU finished them before the completion.
                         let (x, y) = unsafe {
@@ -162,9 +202,10 @@ pub(super) fn late_copy_back(
                             )
                         };
                         if x != y {
-                            won[b / 64] |= 1 << (b % 64);
+                            changed_now[b / 64] |= 1 << (b % 64);
                         }
                     }
+                    let won: Mask = std::array::from_fn(|k| changed_now[k] & keep[k]);
                     let own = PageInfo::load_mask(&i.own);
                     let lift: Mask = std::array::from_fn(|k| won[k] & own[k]);
                     if lift.iter().any(|x| *x != 0) {
@@ -188,6 +229,7 @@ pub(super) fn late_copy_back(
                     for k in 0..4 {
                         copy[k] |= won[k];
                     }
+                    frame_won = won;
                     won_n += u64::from(won.iter().map(|x| x.count_ones()).sum::<u32>());
                     exact += 1;
                     end_at
@@ -198,6 +240,25 @@ pub(super) fn late_copy_back(
                 .map(|k| (m[k] & keep[k] & !copy[k]).count_ones())
                 .sum();
             copy_blocks(src, guest, &copy);
+            rw_open::sync_shadow_after_copy(pg, src, &copy, rw_open);
+            if changed_now.iter().any(|&x| x != 0) || last_gpu.contains_key(&pg) {
+                let lg = last_gpu.entry(pg).or_insert_with(|| LastGpu {
+                    changed: [0; 4],
+                    bytes: vec![0; p as usize],
+                });
+                for (d, &s) in lg.changed.iter_mut().zip(&changed_now) {
+                    *d |= s;
+                }
+                let save: Mask = std::array::from_fn(|k| copy[k] & lg.changed[k]);
+                if save.iter().any(|&x| x != 0) {
+                    copy_blocks(src, lg.bytes.as_mut_ptr() as u64, &save);
+                }
+            }
+            let rem = still_stale_for(pg);
+            i.set_stale(&rem);
+            if frame_won.iter().any(|&x| x != 0) {
+                rw_open::demote_won(pg, i, rw_open);
+            }
             i.snap.store(f.max(1), Ordering::Release);
             w.store(cur, Ordering::Release);
             wake_all();

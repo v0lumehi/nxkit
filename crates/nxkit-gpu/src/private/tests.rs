@@ -74,6 +74,79 @@ fn the_written_ranges_cover_stores_copies_and_learned_pools() {
     assert!(r.contains(&(0x5000, 0x1000)), "a learned pool is whole");
 }
 
+#[test]
+fn mesh_draw_written_ranges_respect_task_mesh_and_fragment_reflection() {
+    use crate::detail::{
+        BlendDetail, DepthStencilDetail, DrawDetail, DynamicDetail, ProgramRef, RasterDetail,
+    };
+    let sbuf = |stage, slot, address| UboDetail {
+        stage,
+        slot,
+        address,
+        size: 64,
+        snapshot: None,
+    };
+    let draw = DrawDetail {
+        program: ProgramRef {
+            vertex: Arc::from(""),
+            fragment: Some(Arc::from("fs_prog")),
+            task: Some(Arc::from("ts_prog")),
+            mesh: Some(Arc::from("ms_prog")),
+            geometry: None,
+        },
+        push: None,
+        blend: [BlendDetail::default(); 8],
+        write_masks: [0xf; 8],
+        depth_stencil: DepthStencilDetail::default(),
+        raster: RasterDetail::default(),
+        topology: 4,
+        attributes: Vec::new(),
+        streams: Vec::new(),
+        args: DrawArgs::MeshTasks { first: 0, count: 1 },
+        ubos: Vec::new(),
+        sbufs: vec![
+            sbuf(Stage::Task, 0, 0x1_0000),
+            sbuf(Stage::Mesh, 0, 0x2_0000),
+            sbuf(Stage::Mesh, 1, 0x3_0000),
+            sbuf(Stage::Fragment, 0, 0x4_0000),
+        ],
+        textures: Vec::new(),
+        samplers: Vec::new(),
+        images: Vec::new(),
+        dynamic: DynamicDetail::default(),
+        feedback_input: false,
+        capture: None,
+    };
+    let mut rw = Rw::default();
+    let ts_h = rw.hash_of(draw.program.task.as_ref().unwrap());
+    let ms_h = rw.hash_of(draw.program.mesh.as_ref().unwrap());
+    let fs_h = rw.hash_of(draw.program.fragment.as_ref().unwrap());
+    rw.known.insert((ts_h, (Stage::Task as u32) << 24), false);
+    rw.known.insert((ms_h, (Stage::Mesh as u32) << 24), false);
+    rw.known
+        .insert((ms_h, 1 | (Stage::Mesh as u32) << 24), true);
+    rw.known
+        .insert((fs_h, (Stage::Fragment as u32) << 24), false);
+    let detail = FrameDetail {
+        draws: vec![Arc::new(draw)],
+        ..Default::default()
+    };
+    let r = written_ranges(&detail, &[], &rw);
+    assert!(
+        !r.iter().any(|&(a, _)| a == 0x1_0000),
+        "read-only task sbuf should be skipped"
+    );
+    assert!(
+        !r.iter().any(|&(a, _)| a == 0x2_0000),
+        "read-only mesh sbuf should be skipped"
+    );
+    assert!(r.contains(&(0x3_0000, 64)), "rw mesh sbuf must be included");
+    assert!(
+        !r.iter().any(|&(a, _)| a == 0x4_0000),
+        "read-only fragment sbuf should be skipped"
+    );
+}
+
 // ----- the mirror -----
 
 use super::TEST_TURN as TURN;
@@ -123,4 +196,13 @@ fn dispatch(addr: u64, size: u32) -> FrameDetail {
 
 fn pools_of(g: &Guest, o: Arc<GuestOverlay>) -> crate::guestpools::GuestPools {
     crate::guestpools::GuestPools::whole(VA, g.mem.len(), g.mem.clone()).with_overlay(o)
+}
+
+#[test]
+fn parse_mode_defaults_to_mirror_and_accepts_zero_and_track() {
+    assert_eq!(parse_mode(None), Mode::Mirror);
+    assert_eq!(parse_mode(Some("")), Mode::Mirror);
+    assert_eq!(parse_mode(Some("1")), Mode::Mirror);
+    assert_eq!(parse_mode(Some("0")), Mode::Off);
+    assert_eq!(parse_mode(Some("track")), Mode::Track);
 }

@@ -53,22 +53,11 @@ pub(crate) struct Shared<'a> {
     pub(crate) uploaded: &'a Mutex<FastMap<usize, u64>>,
     /// The snapshots that were uploaded before the chunks started. A lookup needs no lock.
     pub(crate) preloaded: &'a FastMap<usize, u64>,
-    /// Real GPU addresses of CPU-written indirect argument snapshots, keyed by `(guest_addr, bytes)`.
-    pub(crate) indirect_snaps: &'a FastMap<(u64, u32), u64>,
 }
 
 impl Shared<'_> {
-    /// Resolves `bytes` of indirect arguments at guest address `addr`: prefers a renamed copy or an indirect snapshot
-    /// taken at flush time so large CPU-written indirect buffers cannot race, falling back to [`indirect_args`].
+    /// Resolves `bytes` of indirect arguments at guest address `addr`.
     pub(crate) fn indirect_real(&self, addr: u64, bytes: u64) -> Result<u64, Skip> {
-        if let Ok(len) = u32::try_from(bytes) {
-            if let Some(real) = self.env.rename.resolve(addr, len) {
-                return Ok(real);
-            }
-            if let Some(&real) = self.indirect_snaps.get(&(addr, len)) {
-                return Ok(real);
-            }
-        }
         indirect_args(self.pools, addr, bytes).map(|l| l.real)
     }
 

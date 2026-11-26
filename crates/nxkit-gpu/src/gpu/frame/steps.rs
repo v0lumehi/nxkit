@@ -1,4 +1,4 @@
-//! Steps of the frame encode that stand apart: the rename slot, the write tracking, the uploads and the private mode passes.
+//! Steps of the frame encode that stand apart: the write tracking, the uploads and the private mode passes.
 
 use super::*;
 
@@ -10,57 +10,7 @@ type Written = (
     FastMap<TexId, (Dirty, usize)>,
 );
 
-/// What `Gpu::rename_begin` prepares for a frame: rename map, slot buffer, merge runs and indirect snapshots.
-type RenameSlot = (
-    crate::rename::RenameMap,
-    Option<Arc<DataBuffer>>,
-    Vec<crate::rename::MergeRun>,
-    FastMap<(u64, u32), u64>,
-);
-
 impl Gpu {
-    /// The storage ranges that the frame reads from a copy of its own (the overlap, `rename`): the map where
-    /// the bindings read, the buffer of the slot, the merge ranges and CPU-written indirect-arg snapshots.
-    pub(super) fn rename_begin(
-        &self,
-        detail: &FrameDetail,
-        pools: &Arc<GuestPools>,
-        region: usize,
-    ) -> RenameSlot {
-        if crate::overlap::on(self.game_overlap) {
-            let gpu_writes = self.rename.note_rw_writes(detail, &self.programs);
-            let b = self.rename.begin_slot(
-                region,
-                detail.rename.as_ref(),
-                self.gmem.learned(),
-                &gpu_writes,
-            );
-            // The merge ranges: where the guest range really is. The copy of each is filled and merged back on the GPU.
-            let runs: Vec<crate::rename::MergeRun> = b
-                .merges
-                .into_iter()
-                .filter_map(|(cap, idx, addr, size, slot, copy2)| {
-                    let guest = pools.resolve(addr, u64::from(size)).ok()?.real;
-                    Some(crate::rename::MergeRun {
-                        cap,
-                        idx,
-                        guest,
-                        slot,
-                        copy2,
-                    })
-                })
-                .collect();
-            (b.map, b.buf, runs, b.indirect_snaps)
-        } else {
-            (
-                crate::rename::RenameMap::new(),
-                None,
-                Vec::new(),
-                FastMap::default(),
-            )
-        }
-    }
-
     /// A render target that is copied back stays at the native size, and the other attachments of its passes with it.
     pub(super) fn pin_copyback_targets(
         &self,

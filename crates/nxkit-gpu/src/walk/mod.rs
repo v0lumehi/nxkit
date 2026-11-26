@@ -191,12 +191,10 @@ pub(crate) struct Walker {
     frame_snaps: std::cell::RefCell<FastMap<SnapKey, Arc<[u8]>>>,
     /// The bytes of a range that is compared with an earlier copy. It keeps its capacity.
     snap_tmp: std::cell::RefCell<Vec<u8>>,
-    /// Whether every bound uniform buffer gets a copy (the overlap, not the `nosnap` knob). Read once per submit,
-    /// because the knob lookup is a string search.
+    /// Whether every bound uniform buffer gets a copy (when early fences are on and `nosnap` is off). Read once per
+    /// submit, because the knob lookup is a string search.
     copy_all: bool,
-    /// The `overlap` key of `game.json`.
-    game_overlap: bool,
-    /// Whether the storage buffers of a draw get a copy too (the overlap, not the `nosnapsbuf` knob).
+    /// Whether the storage buffers of a draw get a copy too (when early fences are on and `nosnapsbuf` is off).
     snap_sbufs: bool,
     prof: prof::Prof,
     /// The bytes of the uniform update that is being written. It keeps its capacity between updates.
@@ -239,7 +237,6 @@ impl Walker {
             frame_snaps: std::cell::RefCell::new(FastMap::default()),
             snap_tmp: std::cell::RefCell::new(Vec::new()),
             copy_all: false,
-            game_overlap: false,
             snap_sbufs: false,
             prof: prof::Prof::new(),
             update_bytes: Vec::new(),
@@ -259,23 +256,15 @@ impl Walker {
         .with_knobs()
     }
 
-    /// Reads the switches that the snapshots depend on.
-    /// Takes the `overlap` key of `game.json`: the walk copies the bound ranges for the frame ahead.
-    pub(crate) fn set_game_overlap(&mut self, on: bool) {
-        self.game_overlap = on;
-        self.read_knobs();
-    }
-
     fn with_knobs(mut self) -> Self {
         self.read_knobs();
         self
     }
 
     fn read_knobs(&mut self) {
-        // The CPU runs ahead of the GPU with the overlap, and with the early fences of `NXKIT_PRIVATE=1`: the bytes of
+        // The CPU runs ahead of the GPU with the early fences of `NXKIT_PRIVATE=1`: the bytes of
         // a bound range that is not private are copied when the work is submitted.
-        let ahead = crate::overlap::on(self.game_overlap)
-            || (crate::private::early() && !crate::knob("privhonest"));
+        let ahead = crate::private::early() && !crate::knob("privhonest");
         self.copy_all = ahead && !crate::knob("nosnap");
         self.snap_sbufs = ahead && !crate::knob("nosnapsbuf");
     }

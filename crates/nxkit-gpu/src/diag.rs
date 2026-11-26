@@ -93,18 +93,13 @@ const KNOBS: &[&str] = &[
     // `nvnSyncWait` returns at once and does not wait for the GPU. Wrong on purpose: the game may write memory that the
     // frame on the GPU still reads. It measures what the wait for the newest fence costs.
     "nowait",
-    // The same as `NXKIT_OVERLAP=1`, switched while the game runs, to compare both at one place.
-    "overlap",
-    // With the overlap on, the uniform buffers are not copied. Wrong on purpose: it measures what the copies cost.
+    // With early fences, the bound uniform buffers are not copied. Wrong on purpose: it measures what the copies cost.
     "nosnap",
     // A render pass that samples what an earlier pass wrote holds its vertex stage too, also when no vertex shader of
     // it samples (the behaviour before the barriers looked at the stages of the bindings).
     "vsbar",
-    // With the overlap on, the storage buffers that draws only read use the buffer itself instead of the walk's copy
-    // (the behaviour before). The CPU's writes for the next frame then race with the GPU.
+    // With early fences, the storage buffers that draws only read use the buffer itself instead of the walk's copy.
     "nosnapsbuf",
-    // With the overlap and the encoder thread, a wait for the newest frame waits for the frame two back.
-    "overlap2",
     // The pass plan keeps render passes that do nothing, and does not merge across a dropped pass or a change of the
     // target set (the behaviour before). For comparing the frame time.
     "nopassmerge",
@@ -143,32 +138,6 @@ const KNOBS: &[&str] = &[
     "nancomp",
     // With `NXKIT_DIAG=ubodump`, every dispatch of a sampled frame is dumped, not only the listed programs (400 lines).
     "ubodumpall",
-    // With the overlap on, the renamed storage ranges are bound as usual but never written back (`rename`).
-    "renamenowb",
-    // With the overlap on, no storage range is renamed at bind time. The learning still runs (`rename`).
-    "renameoff",
-    // With the overlap on, a frame that binds a written range that the CPU also writes while the frame runs waits in full
-    // (`rename`).
-    "conflictwait",
-    // With the overlap on, a merge range whose words that both the CPU and the GPU write keep growing becomes `Conflict`
-    // and its frames wait in full, the behaviour before the merge kernels left the CPU's words in flight alone (`rename`).
-    "growconflict",
-    // With the overlap on, a frame that binds a written storage range that is `Never`, `Idle` or undecided waits in full
-    // (`rename`).
-    "waitnever",
-    // The same for a frame that binds a read-only storage range that is not a snapshot.
-    "waitwatch",
-    // The same for a frame that binds a merge range.
-    "waitmerge",
-    // The same for a frame that binds a snapshot.
-    "waitsnap",
-    // The same for a frame that binds a renamed range.
-    "waitrename",
-    // The same for a frame with a vertex, index or indirect buffer, or a buffer copy source, of at most 1 MiB whose bytes
-    // changed since the flush before.
-    "waitother",
-    // Every frame waits in full: the control.
-    "waitall",
     // The draws of the programs of `NXKIT_DIAG_FS` print nothing and use none of their lines: set it until the game
     // reaches the scene to look at, then clear it.
     "fsquiet",

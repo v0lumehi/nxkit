@@ -119,11 +119,11 @@ const POISON: u32 = 0x7fc0_0000;
 /// What `NXKIT_PRIVATE` asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Mode {
-    /// Not set.
+    /// Disabled (`NXKIT_PRIVATE=0`).
     Off,
     /// `track`: step 1, the counters only.
     Track,
-    /// `1`: steps 2 and 3, the mirror and the early fences.
+    /// `1` (default): steps 2 and 3, the mirror and the early fences.
     Mirror,
 }
 
@@ -135,22 +135,31 @@ thread_local! {
     static FORCE_POISON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// The mode of `NXKIT_PRIVATE`. Read once. Other values warn once and leave it off.
+pub(crate) fn parse_mode(val: Option<&str>) -> Mode {
+    match val.map(str::trim) {
+        None | Some("" | "1") => Mode::Mirror,
+        Some("0") => Mode::Off,
+        Some("track") => Mode::Track,
+        Some(v) => {
+            eprintln!(
+                "nxkit-gpu: NXKIT_PRIVATE={v} is not a mode that exists, only `1`, `0` and `track` do; using `1`"
+            );
+            Mode::Mirror
+        }
+    }
+}
+
+/// The mode of `NXKIT_PRIVATE`. Read once (defaults to `Mirror`; `0` disables it).
 pub(crate) fn mode() -> Mode {
     #[cfg(test)]
     if let Some(m) = FORCE.with(std::cell::Cell::get) {
         return m;
+    } else if crate::settings::env().private.is_none() {
+        // Keep parallel unit tests isolated from the process-global page tracker signal handler.
+        return Mode::Off;
     }
     static MODE: OnceLock<Mode> = OnceLock::new();
-    *MODE.get_or_init(|| match crate::settings::env().private.as_deref() {
-        Some("track") => Mode::Track,
-        Some("1") => Mode::Mirror,
-        Some(v) if !v.is_empty() && v != "0" => {
-            eprintln!("nxkit-gpu: NXKIT_PRIVATE={v} is not a mode that exists, only `track` and `1` do; it stays off");
-            Mode::Off
-        }
-        _ => Mode::Off,
-    })
+    *MODE.get_or_init(|| parse_mode(crate::settings::env().private.as_deref()))
 }
 
 /// One test at a time may use the page tracker, which is one per process.

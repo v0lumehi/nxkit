@@ -28,8 +28,6 @@ pub struct GpuSettings {
     /// Encode the frames on a thread of their own (`game.json` key `enc_thread`). The environment variable
     /// `NXKIT_ENC_THREAD=1` turns it on too.
     pub enc_thread: bool,
-    /// The CPU runs one frame ahead of the GPU (`game.json` key `overlap`). `NXKIT_OVERLAP=1` turns it on too.
-    pub overlap: bool,
     /// The order inside a GOB of the guest textures: [`GobOrder::Switch2`] for a game of the Switch 2.
     pub gob_order: GobOrder,
     /// A writable folder of the title for the runtime pipeline cache (see `pipelines/runtime.rs`), or none.
@@ -163,7 +161,6 @@ impl Default for GpuSettings {
             threads: 0,
             scale: 2.0,
             enc_thread: false,
-            overlap: false,
             gob_order: GobOrder::Tegra,
             runtime_cache: None,
             build_id: 0,
@@ -224,7 +221,7 @@ pub struct GpuEnv {
     pub copyback: bool,
     /// `NXKIT_COPYBACK_MAX_MB` (128): the storage MiB that one frame may copy back.
     pub copyback_max_mb: u64,
-    /// `NXKIT_PRIVATE` as given (`track`, `1`). The mode is read from it in `private`.
+    /// `NXKIT_PRIVATE` as given (`1`, `0`, `track`; defaults to `1`). The mode is read from it in `private`.
     pub private: Option<String>,
     /// `NXKIT_GPU_BUFFER`: one no-copy Metal buffer per NVN memory pool (`pools`, the default) or one buffer over the whole
     /// guest range (`whole`). Only the pool pages are wired (`docs/plans/gpu-buffer-per-pool.md`).
@@ -235,8 +232,6 @@ pub struct GpuEnv {
     pub private_late: bool,
     /// `NXKIT_PRIVATE_READOPEN` (on unless `0`): reads without a trap.
     pub private_read_open: bool,
-    /// `NXKIT_OVERLAP=1`: the CPU runs one frame ahead of the GPU.
-    pub overlap: bool,
     /// `NXKIT_DIAG_DIR` (`/tmp/fmap`): where the diagnostics write files.
     pub diag_dir: PathBuf,
     /// `NXKIT_KNOB_FILE`: a file with more knobs, read every frame.
@@ -328,7 +323,6 @@ impl GpuEnv {
                 .unwrap_or(1),
             private_late: not_zero("NXKIT_PRIVATE_LATE"),
             private_read_open: not_zero("NXKIT_PRIVATE_READOPEN"),
-            overlap: one("NXKIT_OVERLAP"),
             diag_dir: env
                 .var_os("NXKIT_DIAG_DIR")
                 .map_or_else(|| PathBuf::from("/tmp/fmap"), PathBuf::from),

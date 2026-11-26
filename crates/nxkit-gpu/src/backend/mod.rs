@@ -104,19 +104,12 @@ pub struct GpuBackend {
     walker: Mutex<Walker>,
     /// The memory writes that the walker has not seen yet. It has a lock of its own, so a write never waits for a walk.
     invalidations: Arc<Invalidations>,
-    /// The counters of `NXKIT_DIAG=overlap`.
-    overlap: crate::overlap::Overlap,
-    /// The `overlap` key of `game.json`.
-    game_overlap: bool,
     /// Frees the detail of a frame off the game's render thread.
     dropper: util::Dropper,
     /// The diagnostics of the present path.
     diag: presdiag::PresentDiag,
     /// What the screen showed of the presents, shared with the NVN present (W26).
     screen: Arc<nxkit_nvn::screen::Screen>,
-    /// The storage ranges that the overlap renames per frame: learned and captured at the flush, written back in a CPU
-    /// wait (`rename`). The encoder owns the same object.
-    rename: Arc<crate::rename::Renamer>,
     scale: f32,
     /// The last fence whose frame was encoded.
     encoded: AtomicU64,
@@ -207,11 +200,9 @@ impl GpuBackend {
         let events = events::EventSignals::new(space.clone());
         let gpu = Gpu::with_config(ctx, space.clone(), settings.config())?;
         let pool_hint = gpu.pool_hint();
-        let rename = gpu.renamer();
-        let mut walker = Walker::new(settings.shader_dir.clone(), space.address_map());
-        walker.set_game_overlap(settings.overlap);
+        let walker = Walker::new(settings.shader_dir.clone(), space.address_map());
         let invalidations = walker.invalidations();
-        // `NXKIT_PRIVATE`: the page tracker and, for `1`, the mirror. With the mirror the overlap and the renamer are off.
+        // `NXKIT_PRIVATE`: the page tracker and, for `1` (default), the mirror.
         crate::private::attach(
             ctx,
             space.host_base(),
@@ -242,11 +233,8 @@ impl GpuBackend {
                 pool_hint,
                 walker: Mutex::new(walker),
                 invalidations,
-                overlap: crate::overlap::Overlap::default(),
-                game_overlap: settings.overlap,
                 dropper: util::Dropper::default(),
                 diag: presdiag::PresentDiag::default(),
-                rename,
                 screen: settings.screen.clone(),
                 scale: settings.scale,
                 encoded: AtomicU64::new(0),
@@ -293,11 +281,8 @@ impl GpuBackend {
         let _ = self.pacer.set(pacer);
     }
 
-    /// Waits for every encoded frame. `waited` is the fence that a CPU wait asked for: the renamed storage ranges of the
-    /// frames up to it go back into guest memory (`rename`). A drain that no CPU wait asked for (the encoder thread's own,
-    /// for a copy-back) passes `None` and writes nothing back, because the CPU may already have reset a word of the next
-    /// frame.
-    fn drain(&self, waited: Option<u64>) -> bool {
+    /// Waits for every encoded frame and updates counters.
+    fn drain(&self) -> bool {
         let mut gpu = self.lock_gpu();
         let upto = self.encoded.load(Ordering::Acquire);
         let result = gpu.wait();
@@ -306,30 +291,10 @@ impl GpuBackend {
             self.screen
                 .set_gpu_ms((stats.gpu_end_s - stats.gpu_start_s) * 1e3);
         }
-        let (finished, ok) = self.finish_batches(upto);
+        let (finished, _ok) = self.finish_batches(upto);
         self.write_counters(upto, &finished);
         self.done.fetch_max(upto, Ordering::AcqRel);
-        if let Some(w) = waited
-            && ok
-            && result.is_ok()
-        {
-            self.renamed_wait(w.min(upto), format_args!("drain for fence {w}"));
-        }
         result.is_ok()
-    }
-
-    /// The CPU waited for fence `waited` and the GPU is done with it: the renamed ranges of the frames up to it go back
-    /// into guest memory, and the ranges that are judged read their bytes after the frame.
-    fn renamed_wait(&self, waited: u64, who: std::fmt::Arguments<'_>) {
-        if !crate::overlap::on(self.game_overlap) {
-            return;
-        }
-        self.rename.after_wait(
-            waited,
-            self.done.load(Ordering::Acquire),
-            self.flushed.load(Ordering::Acquire),
-            who,
-        );
     }
 
     /// Keeps the timestamp reports and the GPU counters of a frame until the GPU is seen to finish it. The event
@@ -428,7 +393,7 @@ impl GpuBackend {
             .collect();
         let synced = report.synced().iter().filter_map(&epoch).collect();
         if !report.copied_back.is_empty() {
-            self.drain(None);
+            self.drain();
         }
         self.note_report(&report);
         Ok(TableUpdate { wrote, synced })
@@ -478,7 +443,7 @@ impl GpuBackend {
         }
         if !report.copied_back.is_empty() {
             self.copied_fence.fetch_max(fence.0, Ordering::AcqRel);
-            self.drain(None);
+            self.drain();
         }
         let synced = report.synced();
         let in_sync: crate::fastmap::FastSet<TexId> = synced.iter().copied().collect();

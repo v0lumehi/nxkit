@@ -185,30 +185,74 @@ impl Pages {
                 && SHARED.alias.load(Ordering::Acquire) != 0;
             let mut later: Vec<FrameRuns> = Vec::new();
             let alias = SHARED.alias.load(Ordering::Acquire);
-            if SHARED.late.load(Ordering::Acquire) && alias != 0 {
+            let due = if SHARED.late.load(Ordering::Acquire) && alias != 0 {
                 // Under the control mutex, so that a flush that tags a page again is either before it (the page is
                 // copied here) or after it (the flush copies a page of a complete frame itself).
                 let mut c = ctrl();
-                for (f, runs) in &due {
-                    let m = due_masks
-                        .iter()
-                        .position(|(g, _)| g == f)
-                        .map(|pos| due_masks.swap_remove(pos).1);
-                    let copies = due_copies
-                        .iter()
-                        .position(|l| l.frame == *f)
-                        .map(|pos| due_copies.swap_remove(pos));
+                let cc = &mut *c;
+                struct DueItem {
+                    frame: u64,
+                    runs: Vec<(u32, u32)>,
+                    masks: Option<Vec<Vec<Mask>>>,
+                    copies: Option<LateCopy>,
+                }
+                let items: Vec<DueItem> = due
+                    .into_iter()
+                    .map(|(f, runs)| {
+                        let masks = due_masks
+                            .iter()
+                            .position(|(g, _)| *g == f)
+                            .map(|pos| due_masks.swap_remove(pos).1);
+                        let copies = due_copies
+                            .iter()
+                            .position(|l| l.frame == f)
+                            .map(|pos| due_copies.swap_remove(pos));
+                        DueItem {
+                            frame: f,
+                            runs,
+                            masks,
+                            copies,
+                        }
+                    })
+                    .collect();
+                for idx in 0..items.len() {
+                    let (head, tail) = items.split_at(idx + 1);
+                    let item = &head[idx];
+                    let mut still_stale = |pg: u32| {
+                        let mut out = [0u64; 4];
+                        for t in tail {
+                            late::or_frame_stale(pg, &t.runs, t.masks.as_deref(), &mut out);
+                        }
+                        for (gf, gr) in &cc.frames {
+                            let gm = cc
+                                .masks
+                                .iter()
+                                .find(|(mf, _)| mf == gf)
+                                .map(|(_, mm)| mm.as_slice());
+                            late::or_frame_stale(pg, gr, gm, &mut out);
+                        }
+                        out
+                    };
                     late_copy_back(
-                        *f,
-                        runs,
-                        m.as_deref(),
-                        copies.as_ref(),
-                        &mut c.carry,
+                        item.frame,
+                        &item.runs,
+                        item.masks.as_deref(),
+                        item.copies.as_ref(),
+                        &mut still_stale,
+                        &mut cc.carry,
+                        &mut cc.rw_open,
+                        &mut cc.last_gpu,
                         mirror,
                         alias,
                     );
                 }
-            }
+                items
+                    .into_iter()
+                    .map(|i| (i.frame, i.runs))
+                    .collect::<Vec<_>>()
+            } else {
+                due
+            };
             for (f, runs) in due {
                 close_opened(f, &runs);
                 if copy_back {
@@ -228,8 +272,8 @@ impl Pages {
                     }
                 }
             }
-            wake_all();
             SHARED.settled.fetch_max(frame, Ordering::AcqRel);
+            wake_all();
             if !later.is_empty() {
                 eager_submit(later);
             }
@@ -249,6 +293,7 @@ impl Pages {
             release_runs(f, &runs);
         }
         SHARED.settled.fetch_max(frame, Ordering::AcqRel);
+        wake_all();
     }
 
     /// The late staging of `NXKIT_PRIVATE=1` with the knob `privlatestage`: the pages that the CPU wrote since the flush of
@@ -258,7 +303,7 @@ impl Pages {
             return Vec::new();
         }
         let mut c = ctrl();
-        let carry = &mut c.carry;
+        let cc = &mut *c;
         let p = page();
         let base = SHARED.base.load(Ordering::Acquire);
         let n = SHARED.log_n.swap(0, Ordering::AcqRel).min(LOG_CAP);
@@ -293,7 +338,7 @@ impl Pages {
                 back.push(pg);
             }
         }
-        stager.begin(back.len() + emu.len());
+        stager.begin(back.len() + emu.len() + cc.rw_open.len());
         for (s, e) in runs_of(&back) {
             protect_pages(s, e, PROT_READ, true);
             for pg in s..e {
@@ -301,10 +346,23 @@ impl Pages {
                 let bytes = unsafe {
                     std::slice::from_raw_parts((base + u64::from(pg) * p) as *const u8, p as usize)
                 };
-                stage_carry(stager, carry, pg, bytes, stage_skip(pg as usize));
+                stage_carry(stager, &mut cc.carry, pg, bytes, stage_skip(pg as usize));
             }
         }
-        if self.stage_emulated(&emu, &back, stager, carry) > 0 {
+        let mut rw_staged = Vec::new();
+        rw_open::stage_rw_open_late(
+            cc,
+            SHARED.alias.load(Ordering::Acquire),
+            stager,
+            &mut rw_staged,
+        );
+        for pg in rw_staged {
+            if back.binary_search(&pg).is_err() {
+                back.push(pg);
+                back.sort_unstable();
+            }
+        }
+        if self.stage_emulated(&emu, &back, stager, &mut cc.carry, &mut cc.rw_open, &[]) > 0 {
             let extra: Vec<u32> = emu
                 .iter()
                 .copied()
@@ -326,10 +384,16 @@ impl Pages {
         done: &[u32],
         stager: &mut dyn Stager,
         carry: &mut BTreeMap<u32, Carry>,
+        rw_open: &mut BTreeMap<u32, Hot>,
+        just_promoted: &[u32],
     ) -> u32 {
         let mut n = 0;
         for &pg in emu {
             let Some(i) = info(pg as usize) else { continue };
+            let promoted = just_promoted.binary_search(&pg).is_ok();
+            if rw_open.contains_key(&pg) && !promoted {
+                continue;
+            }
             if i.emu.swap(0, Ordering::AcqRel) & 1 == 0 || done.binary_search(&pg).is_ok() {
                 continue;
             }
@@ -339,6 +403,9 @@ impl Pages {
             let Some(bytes) = self.alias_page(pg) else {
                 continue;
             };
+            if promoted && let Some(h) = rw_open.get_mut(&pg) {
+                h.shadow = bytes.to_vec();
+            }
             stage_carry(stager, carry, pg, bytes, i.take_skip());
             n += 1;
         }

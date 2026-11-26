@@ -65,6 +65,7 @@ impl Pages {
                 {
                     newly.push(pg);
                     member_bit(pg as usize, true);
+                    cc.last_gpu.remove(&pg);
                 }
             }
         }
@@ -133,9 +134,16 @@ impl Pages {
             emu.dedup();
         }
         st.log_ns = tick();
-        stager.begin(dirty.len() + emu.len() + cc.hot.len() + 64);
-        // The pages the CPU dirtied in several flushes in a row stay writable (step 5).
+        let late_on = SHARED.late.load(Ordering::Acquire);
+        let alias = SHARED.alias.load(Ordering::Acquire);
         let hot_on = SHARED.hot_on.load(Ordering::Acquire);
+        let rw_open_eligible = hot_on
+            && late_on
+            && alias != 0
+            && poison.is_none()
+            && SHARED.read_open_on.load(Ordering::Acquire);
+        stager.begin(dirty.len() + emu.len() + cc.hot.len() + cc.rw_open.len() + 64);
+        // The pages the CPU dirtied in several flushes in a row stay writable (step 5).
         let mut to_hot: Vec<u32> = Vec::new();
         if hot_on {
             for &pg in &cc.prev_dirty {
@@ -185,8 +193,20 @@ impl Pages {
             stage_run(stager, &mut cc.carry, s, e);
         }
         st.staged = back.len() as u32;
-        st.emu_staged = self.stage_emulated(&emu, &back, stager, &mut cc.carry);
-        st.staged += st.emu_staged;
+        let (rw_staged, rw_demoted) =
+            rw_open::stage_rw_open(cc, &runs_w, alias, rw_open_eligible, stager);
+        let just_promoted = rw_open::update_emu_streaks(cc, &emu, &runs_w, rw_open_eligible);
+        st.emu_staged = self.stage_emulated(
+            &emu,
+            &back,
+            stager,
+            &mut cc.carry,
+            &mut cc.rw_open,
+            &just_promoted,
+        );
+        st.staged += st.emu_staged + rw_staged;
+        st.hot_staged += rw_staged;
+        st.demoted += rw_demoted;
         st.stage_ns = tick();
         // The writable pages: each is compared with the bytes staged for it last, and staged when it differs. A page that
         // did not change for [`HOT_QUIET`] flushes is protected again. The compare after the protection catches a store
@@ -202,6 +222,7 @@ impl Pages {
             );
         }
         if !cc.hot.is_empty() {
+            let hot0 = st.hot_staged;
             let mut gone: Vec<u32> = Vec::new();
             let mut quiet: Vec<u32> = Vec::new();
             for (&pg, h) in cc.hot.iter_mut() {
@@ -275,15 +296,13 @@ impl Pages {
                     st.hot_staged += 1;
                 }
             }
-            st.demoted = demote.len() as u32;
-            st.staged += st.hot_staged;
+            st.demoted += demote.len() as u32;
+            st.staged += st.hot_staged - hot0;
         }
-        st.hot = cc.hot.len() as u32;
+        st.hot = (cc.hot.len() + cc.rw_open.len()) as u32;
         st.hot_ns = tick();
         // 3. The pages of the frame.
         let masks = range_masks(&runs_w, written);
-        let late_on = SHARED.late.load(Ordering::Acquire);
-        let alias = SHARED.alias.load(Ordering::Acquire);
         let mut late_pages: Vec<u32> = Vec::new();
         for (ri, &(s, e)) in runs_w.iter().enumerate() {
             for pg in s..e {
@@ -300,7 +319,20 @@ impl Pages {
                         if late_active(i) {
                             let f = cur >> FRAME_SHIFT;
                             if !late_current(i, f) {
+                                let cur_stale = i.stale();
                                 copy_stale(pg as usize, mirror, alias, false, f);
+                                rw_open::sync_shadow_stale(pg, alias, &cur_stale, &mut cc.rw_open);
+                                if let Some(lg) = cc.last_gpu.get_mut(&pg) {
+                                    let upd: Mask =
+                                        std::array::from_fn(|k| cur_stale[k] & lg.changed[k]);
+                                    if upd.iter().any(|&x| x != 0) {
+                                        copy_blocks(
+                                            alias + u64::from(pg) * p,
+                                            lg.bytes.as_mut_ptr() as u64,
+                                            &upd,
+                                        );
+                                    }
+                                }
                                 SHARED.late_flush_copies.fetch_add(1, Ordering::Relaxed);
                             }
                             for a in &i.stale {
@@ -309,6 +341,7 @@ impl Pages {
                             i.snap.store(f.max(1), Ordering::Release);
                         } else {
                             i.snap_reset(SnapWhy::FlushIdle);
+                            cc.last_gpu.remove(&pg);
                         }
                     }
                 }
@@ -353,6 +386,41 @@ impl Pages {
                         && i.snap.load(Ordering::Acquire) != 0
                         && late_active(i)
                     {
+                        if poison.is_none()
+                            && let Some(lg) = cc.last_gpu.get(&pg)
+                        {
+                            let own = PageInfo::load_mask(&i.own);
+                            let cand: Mask = std::array::from_fn(|k| {
+                                masks[ri][(pg - s) as usize][k] & lg.changed[k] & !own[k]
+                            });
+                            if cand.iter().any(|&x| x != 0) {
+                                let page_alias = alias + u64::from(pg) * p;
+                                let blocks = (p / BLOCK) as usize;
+                                let mut diff: Mask = [0; 4];
+                                for b in (0..blocks).filter(|&b| has(&cand, b)) {
+                                    let o = b * BLOCK as usize;
+                                    // SAFETY: `alias` maps the whole tracked guest range with read/write access and `pg` is in it.
+                                    let live = unsafe {
+                                        std::slice::from_raw_parts(
+                                            (page_alias + o as u64) as *const u8,
+                                            BLOCK as usize,
+                                        )
+                                    };
+                                    if live != &lg.bytes[o..o + BLOCK as usize] {
+                                        diff[b / 64] |= 1 << (b % 64);
+                                    }
+                                }
+                                if diff.iter().any(|&x| x != 0) {
+                                    copy_blocks(lg.bytes.as_ptr() as u64, page_alias, &diff);
+                                    rw_open::sync_shadow_after_copy(
+                                        pg,
+                                        lg.bytes.as_ptr() as u64,
+                                        &diff,
+                                        &mut cc.rw_open,
+                                    );
+                                }
+                            }
+                        }
                         late_pages.push(pg);
                     }
                 }
@@ -369,23 +437,15 @@ impl Pages {
                 && poison.is_none()
                 && SHARED.read_open_on.load(Ordering::Acquire)
             {
-                let readable = |pg: u32| {
-                    info(pg as usize).is_some_and(|i| i.snap.load(Ordering::Acquire) != 0)
-                };
                 let mut run_start = s;
                 while run_start < e {
-                    let open = readable(run_start);
+                    let prot = rw_open::step3_prot(run_start, cc);
                     let mut run_end = run_start + 1;
-                    while run_end < e && readable(run_end) == open {
+                    while run_end < e && rw_open::step3_prot(run_end, cc) == prot {
                         run_end += 1;
                     }
-                    protect_pages(
-                        run_start,
-                        run_end,
-                        if open { PROT_READ } else { PROT_NONE },
-                        true,
-                    );
-                    if open {
+                    protect_pages(run_start, run_end, prot, true);
+                    if prot != PROT_NONE {
                         SHARED
                             .read_open
                             .fetch_add(u64::from(run_end - run_start), Ordering::Relaxed);
@@ -401,6 +461,7 @@ impl Pages {
                     if let Some(i) = info(pg as usize) {
                         i.snap_reset(SnapWhy::Poison);
                     }
+                    cc.last_gpu.remove(&pg);
                     let stale = info(pg as usize).map_or([u64::MAX; 4], PageInfo::stale);
                     protect_pages(pg, pg + 1, PROT_RW, true);
                     for b in 0..(p / BLOCK) {

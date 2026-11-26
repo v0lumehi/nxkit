@@ -235,33 +235,6 @@ reasons! {
     /// or 3D textures, or textures a shader cannot read or write). A copy of an equal size runs as a blit without the
     /// mirror. The example names the textures and the reason.
     CopyMirrorLost => "copy.mirror-lost",
-    /// Overlap: ranges of storage buffers that the GPU read and wrote from a copy of their own in this frame's batch
-    /// slot (`nxkit-gpu` `rename`), counted per range and frame. A count, not a loss.
-    OverlapRenamed => "overlap.renamed",
-    /// Overlap: 32-bit words of a renamed range that the GPU changed and that went back into guest memory when the CPU
-    /// waited for the frame. A count, not a loss.
-    OverlapWritebackWords => "overlap.writeback-words",
-    /// Overlap: words of a renamed range that the GPU changed and that did not go back, because the CPU had written
-    /// the word since the frame was flushed. A count, not a loss.
-    OverlapWritebackSkipped => "overlap.writeback-skipped",
-    /// Overlap: a learned range that this frame did not rename (another binding, a copy, a buffer of another kind or a
-    /// raw global write meets it). It is bound as before. A count, not a loss.
-    OverlapRenameExcluded => "overlap.rename-excluded",
-    /// Overlap: bytes of snapshots (read-only ranges that the CPU writes while a frame runs) copied at the flush of a
-    /// frame. A count, not a loss.
-    OverlapSnapshotBytes => "overlap.snapshot-bytes",
-    /// Overlap: snapshots that a frame did not copy because the bytes of its snapshots went over the budget of a frame
-    /// (8 MiB). They are bound to guest memory as before.
-    OverlapSnapshotOverBudget => "overlap.snapshot-over-budget",
-    /// Overlap: merge ranges (written by the GPU and, in other words, by the CPU while a frame runs) that a frame bound
-    /// to a copy that the GPU fills and merges back, counted per range and frame. A count, not a loss.
-    OverlapMergeRanges => "overlap.merge-ranges",
-    /// Overlap: ranges whose words that the CPU writes in flight and words that the GPU writes overlap. The wait for a
-    /// frame that binds one is a full wait. Counted once per range.
-    OverlapMergeConflict => "overlap.merge-conflict",
-    /// Overlap: a range that two bindings (programs or slots) need in ways that cannot be combined (a merge and a
-    /// renamed range). The wait for a frame that binds it is a full one. A count, not a loss.
-    OverlapKeyDisagree => "overlap.key-disagree",
 }
 
 impl Reason {
@@ -284,13 +257,6 @@ impl Reason {
             && self != Reason::BufferOpsSerial
             && self != Reason::CopyScaled
             && self != Reason::CopyScaledLinear
-            && self != Reason::OverlapRenamed
-            && self != Reason::OverlapWritebackWords
-            && self != Reason::OverlapWritebackSkipped
-            && self != Reason::OverlapRenameExcluded
-            && self != Reason::OverlapSnapshotBytes
-            && self != Reason::OverlapMergeRanges
-            && self != Reason::OverlapKeyDisagree
     }
 }
 

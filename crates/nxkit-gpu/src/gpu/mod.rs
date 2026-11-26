@@ -102,8 +102,6 @@ pub struct GpuConfig {
     pub prewarm_screen: crate::ScreenHook,
     /// The hooks of the host's diagnostics for each batch.
     pub batch_hooks: Option<nxkit_metal::BatchHooks>,
-    /// The CPU runs one frame ahead of the GPU (`game.json` key `overlap`).
-    pub overlap: bool,
     /// The draws that the temporal upscale replaces (`temporal_upscale` of `game.json`, R72), or none.
     pub temporal_upscale: Option<crate::TemporalUpscale>,
     /// The meeting point with the control socket for the shader hot swap (W37).
@@ -134,7 +132,6 @@ impl crate::GpuSettings {
             build_id: self.build_id,
             shipped_list: self.shipped_list.clone(),
             prewarm_screen: self.prewarm_screen.clone(),
-            overlap: self.overlap,
             temporal_upscale: self.temporal_upscale.clone(),
             shader_hub: self.shader_hub.clone(),
             batch_hooks: self.batch_hooks.map(|h| nxkit_metal::BatchHooks {
@@ -159,7 +156,6 @@ impl Default for GpuConfig {
             shipped_list: None,
             prewarm_screen: crate::ScreenHook::default(),
             batch_hooks: None,
-            overlap: false,
             temporal_upscale: None,
             shader_hub: None,
         }
@@ -205,19 +201,13 @@ pub struct Gpu {
     barriers: BarrierState,
     ring: BatchRing,
     threads: usize,
-    /// The `overlap` key of `game.json`.
-    game_overlap: bool,
     last: Option<SubmittedBatch>,
-    /// The batch before `last`, while it may still run: the frame that `wait_older` waits for.
-    older: Option<SubmittedBatch>,
     /// The registered pools, one entry per registration that was not finalized yet.
     pools: Vec<(u64, u64)>,
     copyback: CopyBack,
     native: crate::native::Native,
     /// The visibility result buffers of the GPU counters (`queries`).
     vis_pool: Arc<crate::queries::VisPool>,
-    /// The learner and the per-slot copies of the storage ranges that the overlap renames (`rename`). The backend shares it.
-    rename: Arc<crate::rename::Renamer>,
     /// The temporal upscale of `game.json`, when it is on (`tupscale`).
     tupscale: Option<crate::tupscale::Tupscale>,
 }
@@ -244,7 +234,6 @@ impl Gpu {
             pipelines.runtime_start(plan, &config.shader_dir, &config.prewarm_screen);
         }
         let transfer = Transfer::new(ctx, pipelines.cache(), config.gob_order)?;
-        let rename = Arc::new(crate::rename::Renamer::new(ctx, guest.clone()));
         Ok(Self {
             ctx: ctx.clone(),
             guest,
@@ -274,22 +263,13 @@ impl Gpu {
                 ring
             },
             threads,
-            game_overlap: config.overlap,
             last: None,
-            older: None,
             pools: Vec::new(),
             copyback: CopyBack::default(),
             native: crate::native::Native::new(),
             vis_pool: Arc::default(),
-            rename,
             tupscale: crate::tupscale::Tupscale::new(ctx, config.temporal_upscale),
         })
-    }
-
-    /// The learner and the copies of the renamed storage ranges. The backend takes the capture at the flush of a frame
-    /// and writes the ranges back in a CPU wait.
-    pub(crate) fn renamer(&self) -> Arc<crate::rename::Renamer> {
-        self.rename.clone()
     }
 
     /// The texture ids that shaders read through the pool table and the sampler epoch of the table. The front end reads
@@ -443,11 +423,6 @@ impl Gpu {
     /// The newest batch that went to the GPU, to wait for it without this lock.
     pub fn last_submitted(&self) -> Option<SubmittedBatch> {
         self.last.clone()
-    }
-
-    /// Waits until the GPU finished the batch before the newest one, and leaves the newest one running.
-    pub fn wait_older(&mut self) -> Result<Option<CommandBufferStats>> {
-        self.older.take().map(|b| b.wait()).transpose()
     }
 
     /// Waits until the GPU finished the last submitted frame. The result is `None` when nothing was submitted.

@@ -266,3 +266,30 @@ fn accesses_outside_the_written_bytes_are_done_by_the_handler_on_several_threads
     assert_eq!(pg.state_of(m.addr(1)), "clean");
     pg.set_mirror(0);
 }
+
+#[test]
+fn the_alias_works_on_a_touched_split_private_region() {
+    let _t = TURN.lock().unwrap_or_else(PoisonError::into_inner);
+    let m = Map::new(16);
+    m.store(0, 0, 11);
+    m.store(4, 9, 22);
+    // Splitting the private mapping creates an `SM_PRIVATE_ALIASED` region on the remaining pages.
+    // SAFETY: pages 0..2 lie inside `m`.
+    let r = unsafe { mprotect(m.addr(0) as *mut c_void, (2 * P) as usize, PROT_READ) };
+    assert_eq!(r, 0);
+    let mir = Map::new(8);
+    let pg = Pages::global();
+    pg.attach(m.addr(4), 8 * P);
+    pg.set_mirror(mir.addr(0));
+    pg.make_alias().expect("alias on touched split region");
+    let alias = pg.alias_page(0).expect("alias");
+    assert_eq!(alias[9], 22);
+
+    protect_pages(0, 1, PROT_NONE, false);
+    let alias_w = alias.as_ptr().cast_mut();
+    // SAFETY: inside page 0 of the writable alias mapping.
+    unsafe { alias_w.add(10).write_volatile(78) };
+    protect_pages(0, 1, PROT_RW, false);
+    assert_eq!(m.load(4, 10), 78);
+    pg.set_mirror(0);
+}

@@ -50,6 +50,7 @@ mod info;
 mod late;
 mod mirror;
 mod runs;
+mod rw_open;
 mod shared;
 mod signal;
 mod stats;
@@ -182,6 +183,8 @@ struct PageInfo {
     /// CPU wrote them after that frame was flushed.
     hold: [AtomicU64; 4],
     hold_frame: AtomicU32,
+    /// Epoch until which CPU writes to `stale` blocks keep this page `PROT_READ` (not `rw_open`).
+    late_writer: AtomicU32,
 }
 
 /// Why the guest bytes of a page stopped being a completed frame's (`PageInfo::snap` went to zero), and with it the
@@ -296,12 +299,19 @@ struct Ctrl {
     prev_dirty: Vec<u32>,
     /// The pages that stay writable.
     hot: BTreeMap<u32, Hot>,
+    /// Step 10: consecutive emulated-store flushes per page, previous frame's `emu`, and `read_open` pages left `PROT_RW`.
+    emu_streak: Vec<u8>,
+    prev_emu: Vec<u32>,
+    rw_open: BTreeMap<u32, Hot>,
     /// Results one frame late: the pages of each frame in flight that the GPU copies at the frame's start and end,
     /// oldest first.
     late_copies: VecDeque<LateCopy>,
     /// Results one frame late: CPU blocks that a completion replaced in guest memory with the frame's bytes before a
     /// flush staged them, by page. The next flush stages them.
     carry: BTreeMap<u32, Carry>,
+    /// Results one frame late: last completed frame's GPU bytes for blocks the GPU changed, so a subsequent CPU reset
+    /// staged into the mirror can be hidden from late readers while the next frame runs.
+    last_gpu: BTreeMap<u32, LastGpu>,
 }
 
 /// Results one frame late, exact: the pages of a frame whose bytes game threads read late. The GPU copies them from the
@@ -335,6 +345,12 @@ struct Carry {
     frame: Vec<u8>,
 }
 
+/// Last completed frame's GPU bytes for blocks the GPU changed (`start != end_at`) on an active late page.
+struct LastGpu {
+    changed: Mask,
+    bytes: Vec<u8>,
+}
+
 /// The pages that game threads waited for lately: CPU-read GPU results (step 6). Its own lock: the encoder takes it, not the
 /// flush.
 struct Learned {
@@ -362,8 +378,12 @@ static CTRL: Mutex<Ctrl> = Mutex::new(Ctrl {
     streak: Vec::new(),
     prev_dirty: Vec::new(),
     hot: BTreeMap::new(),
+    emu_streak: Vec::new(),
+    prev_emu: Vec::new(),
+    rw_open: BTreeMap::new(),
     late_copies: VecDeque::new(),
     carry: BTreeMap::new(),
+    last_gpu: BTreeMap::new(),
 });
 static INSTALL: Once = Once::new();
 

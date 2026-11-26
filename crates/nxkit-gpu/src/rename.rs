@@ -42,6 +42,7 @@ pub(crate) use merge::{MergeRun, Phase, encode as merge_encode};
 
 mod capture;
 mod copies;
+mod indirect;
 mod judging;
 mod keys;
 mod learn;
@@ -49,6 +50,7 @@ mod renamer;
 mod waits;
 mod words;
 
+use indirect::*;
 use learn::*;
 use renamer::*;
 use words::*;
@@ -81,12 +83,12 @@ const WATCH_PAUSE: u64 = 600;
 /// Judged frames in a row without a CPU write in flight after which a written range is settled as `Never`.
 pub(crate) const SETTLE_PROBES: u32 = 30;
 /// Flushes after which a settled range is judged again.
-const REPROBE: u64 = 120;
+const REPROBE: u64 = 600;
 /// Flushes in a row in which a classified range passed the check against other uses before the check is skipped for it
 /// (it is made again once in 60 flushes).
 const CLEAR_RUN: u16 = 8;
-/// The largest range that is renamed.
-pub(crate) const MAX_BYTES: u32 = 64 * 1024;
+/// The largest range that is renamed. Matches [`SNAPSHOT_MAX_BYTES`] so vertex/uniform buffers above 64 KiB stay merge candidates instead of oscillating through `Snapshot`.
+pub(crate) const MAX_BYTES: u32 = SNAPSHOT_MAX_BYTES;
 /// The most candidate ranges.
 const MAX_CANDIDATES: usize = 2048;
 /// The part of a buffer of unknown size that counts as touched by a copy or a vertex stream.
@@ -338,6 +340,8 @@ struct State {
     inflight: FastMap<u64, Inflight>,
     /// Ranges that became snapshots in a wait, to announce at the next flush.
     pending_news: Vec<u64>,
+    /// Round-robin cursor through `touched` addresses so low addresses cannot starve later watch candidates.
+    probe_cursor: u64,
 }
 
 /// The CPU writes that were found in a range while a frame that binds it was in flight.
@@ -364,10 +368,10 @@ struct Pending {
     probes: Vec<(usize, u64, u64)>,
 }
 
-/// The last write-back of a range.
+/// The last write-back of a range, stored sparsely as sorted `(word_index, value)` pairs.
 struct Chain {
     epoch: u64,
-    wrote: Vec<Option<u32>>,
+    wrote: Vec<(u32, u32)>,
 }
 
 #[derive(Default)]
@@ -406,6 +410,8 @@ pub(crate) struct Slotted {
     /// The merge ranges and probes: capture, index in it, guest address, size, the real address of the copy and, for a
     /// probe, of the copy as it started (0 for a merge range).
     pub(crate) merges: Vec<(Arc<Capture>, usize, u64, u32, u64, u64)>,
+    /// Real GPU addresses of snapshotted CPU-written indirect argument records, keyed by `(guest_addr, bytes)`.
+    pub(crate) indirect_snaps: FastMap<(u64, u32), u64>,
 }
 
 /// The learner and the copies of the renamed ranges. One per [`crate::Gpu`], shared with the backend.

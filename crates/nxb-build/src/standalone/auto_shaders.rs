@@ -35,12 +35,17 @@ pub(super) fn check_nso_size(nso: &[u8]) -> Result<()> {
 }
 use nxb_split::{jobs, records, scanfile, shaders, src, unity, zstd};
 use nxb_xlate::msl::{self, StageInputs};
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
+#[cfg(test)]
 const SHADER_LIMIT: usize = 20000;
 
+#[cfg(test)]
 struct Owned(Vec<u8>);
+#[cfg(test)]
 impl src::Src for Owned {
     fn len(&self) -> u64 {
         self.0.len() as u64
@@ -56,6 +61,69 @@ impl src::Src for Owned {
         src::Mem(&self.0).read_at(offset, data)
     }
 }
+
+/// Disk-backed `Src` that caches the 16-byte header inline and serves larger range reads via
+/// thread-safe positional I/O (`FileExt::read_exact_at`), returning `bytes() -> None` so large
+/// RomFS assets stream without loading the whole game into RAM.
+struct FileSrc {
+    path: PathBuf,
+    size: u64,
+    head: [u8; 16],
+}
+
+impl FileSrc {
+    fn open(path: PathBuf, size: u64) -> Result<Self> {
+        use std::io::Read;
+        let mut head = [0u8; 16];
+        let n = (size as usize).min(16);
+        if n > 0 {
+            let mut f =
+                std::fs::File::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            f.read_exact(&mut head[..n])
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+        }
+        Ok(Self { path, size, head })
+    }
+
+    fn head_slice(&self) -> &[u8] {
+        &self.head[..(self.size as usize).min(16)]
+    }
+}
+
+impl src::Src for FileSrc {
+    fn len(&self) -> u64 {
+        self.size
+    }
+
+    fn read_at(
+        &self,
+        offset: u64,
+        data: &mut [u8],
+    ) -> std::result::Result<(), nxb_split::SplitError> {
+        use nxb_extract::fileext::FileExt;
+        let Some(end) = offset.checked_add(data.len() as u64) else {
+            return Err(nxb_split::SplitError::Red(
+                "read past the end of the file".into(),
+            ));
+        };
+        if end > self.size {
+            return Err(nxb_split::SplitError::Red(
+                "read past the end of the file".into(),
+            ));
+        }
+        if data.is_empty() {
+            return Ok(());
+        }
+        if end <= 16 {
+            data.copy_from_slice(&self.head[offset as usize..end as usize]);
+            return Ok(());
+        }
+        std::fs::File::open(&self.path)
+            .and_then(|f| f.read_exact_at(data, offset))
+            .map_err(|e| nxb_split::SplitError::Format(format!("{}: {e}", self.path.display())))
+    }
+}
+
 struct Work {
     job: nxb_xlate::job::Job,
     code: Vec<u8>,
@@ -76,16 +144,65 @@ fn work(value: &J, code: Vec<u8>, source: String) -> Result<Work> {
     })
 }
 
-pub(super) fn discover(
-    modules: &[(String, Vec<u8>)],
-    resources: &[(String, Vec<u8>)],
-    ios: bool,
-) -> Result<Vec<(String, Vec<u8>)>> {
-    let profile = shaders::Profile::default();
+fn walk_dir_files(romfs_dir: &Path, overlay: Option<&Path>) -> Result<Vec<jobs::File>> {
+    let mut entries_map = BTreeMap::<String, (PathBuf, u64)>::new();
+    let mut scan = |root: &Path, skip_stamp: bool| -> Result<()> {
+        if !root.is_dir() {
+            return Ok(());
+        }
+        let mut pending = vec![(root.to_path_buf(), String::new())];
+        while let Some((dir, rel)) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))? {
+                let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
+                let name = entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| "RomFS filename is not UTF-8")?;
+                let next = if rel.is_empty() {
+                    name
+                } else {
+                    format!("{rel}/{name}")
+                };
+                if skip_stamp && next == crate::resource_patch::STAMP {
+                    continue;
+                }
+                let kind = entry.file_type().map_err(|e| e.to_string())?;
+                if kind.is_dir() {
+                    pending.push((entry.path(), next));
+                } else if kind.is_file() {
+                    let size = entry
+                        .metadata()
+                        .map_err(|e| format!("{}: {e}", entry.path().display()))?
+                        .len();
+                    entries_map.insert(next, (entry.path(), size));
+                }
+            }
+        }
+        Ok(())
+    };
+    scan(romfs_dir, false)?;
+    if let Some(o) = overlay {
+        scan(o, true)?;
+    }
+    let mut files = Vec::with_capacity(entries_map.len());
+    for (rel, (path, size)) in entries_map {
+        let file_src = FileSrc::open(path, size)?;
+        let live = jobs::deferred(&rel, file_src.head_slice());
+        files.push(jobs::File {
+            rel,
+            live,
+            src: Arc::new(file_src),
+        });
+    }
+    Ok(files)
+}
+
+type NamedFile = (String, Vec<u8>);
+type ModuleScan = (Vec<records::FileResult>, Option<HashMap<u32, String>>);
+
+fn scan_modules(modules: &[(String, Vec<u8>)], profile: &shaders::Profile) -> Result<ModuleScan> {
     let mut results = Vec::new();
-    let mut notes = Vec::new();
     let mut common = None;
-    let mut total = 0usize;
     for (name, nso) in modules {
         safe_name(name)?;
         check_nso_size(nso)?;
@@ -99,141 +216,69 @@ pub(super) fn discover(
             .map_err(|e| e.to_string())?;
         found
             .extend(nxb_split::misc::main_extras(&image, name, &found).map_err(|e| e.to_string())?);
-        let pairs = shaders::var_pairs(&profile, &found, &variations);
+        let pairs = shaders::var_pairs(profile, &found, &variations);
         results.push(records::FileResult {
-            keys: records::uniq(&profile, found, true).map_err(|e| e.to_string())?,
+            keys: records::uniq(profile, found, true).map_err(|e| e.to_string())?,
             pairs,
             ..Default::default()
         });
     }
-    let mut files = Vec::new();
-    if resources.len() > 20000 {
-        return Err("too many shader source files".into());
-    }
-    for (path, data) in resources {
-        let rel = path.strip_prefix("romfs/").unwrap_or(path);
-        total = total
-            .checked_add(data.len())
-            .ok_or("shader source size overflow")?;
-        if total > INPUT_LIMIT {
-            return Err("shader source files exceed 256 MiB".into());
-        }
-        files.push(jobs::File {
-            rel: rel.into(),
-            live: jobs::deferred(rel, &data[..data.len().min(16)]),
-            src: Arc::new(Owned(data.clone())),
-        });
-    }
-    files.sort_by(|a, b| a.rel.cmp(&b.rel));
-    let mut dicts = zstd::Dicts::new();
-    for file in &files {
-        let raw = file.src.bytes().ok_or("shader source bytes unavailable")?;
-        if raw.starts_with(&[0x37, 0xa4, 0x30, 0xec]) {
-            dicts.add(raw).map_err(|e| e.to_string())?;
-        } else if file.rel == "Pack/ZsDic.pack.zs" {
-            let pack = zstd::decompress(raw).map_err(|e| e.to_string())?;
-            for (_, data) in shaders::sarc_members(&pack, &file.rel).map_err(|e| e.to_string())? {
-                if data.starts_with(&[0x37, 0xa4, 0x30, 0xec]) {
-                    dicts.add(data).map_err(|e| e.to_string())?;
-                }
-            }
-        }
-    }
-    let plan = jobs::plan(&files).map_err(|e| e.to_string())?;
-    notes.extend(plan.notes);
-    let ctx = jobs::Ctx {
-        files: &files,
-        dicts: &dicts,
-    };
-    for job in plan.jobs {
-        let out = (job.run)(&ctx, &mut notes).map_err(|e| format!("{}: {e}", job.rel))?;
-        if let Some(result) =
-            scanfile::finish(&profile, out.found, &out.var).map_err(|e| e.to_string())?
-        {
-            results.push(result);
-        }
-    }
-    let env = scanfile::Env {
-        dicts: &dicts,
-        common: common.as_ref(),
-        trees: None,
-    };
-    let mut deferred = Vec::new();
-    let mut plain = Vec::new();
-    let mut trees = unity::ser::Trees::new();
-    for (i, file) in files.iter().enumerate() {
-        if plan.taken.contains(&i) {
-            continue;
-        }
-        let label = format!("/{}", file.rel);
-        let raw = file.src.bytes().ok_or("shader source bytes unavailable")?;
-        let result = if file.live && raw.starts_with(&jobs::nlg::DICT) {
-            let (found, var) = jobs::nlg::shaders(&files, i, &label).map_err(|e| e.to_string())?;
-            scanfile::finish(&profile, found, &var)
-        } else if file.live && jobs::nlg::covered(&file.rel, &files) {
-            Ok(None)
-        } else {
-            scanfile::scan_file(
-                &profile,
-                file.src.as_ref(),
-                &label,
-                &file.rel,
-                &env,
-                &mut notes,
-            )
-        }
-        .map_err(|e| format!("{}: {e}", file.rel))?;
-        if let Some(result) = result {
-            trees.extend(result.trees.clone());
-            if result.defer {
-                deferred.push(i);
-            } else {
-                plain.push((i, result));
-            }
-        }
-    }
-    if !deferred.is_empty() {
-        for (key, value) in unity::ser::known_trees().map_err(|e| e.to_string())? {
-            trees.entry(key).or_insert(value);
-        }
-        let env = scanfile::Env {
-            trees: Some(&trees),
-            ..env
-        };
-        for i in deferred {
-            let file = &files[i];
-            let result = scanfile::scan_file(
-                &profile,
-                file.src.as_ref(),
-                &format!("/{}", file.rel),
-                &file.rel,
-                &env,
-                &mut notes,
-            )
-            .map_err(|e| format!("{}: {e}", file.rel))?;
-            if let Some(result) = result {
-                if result.defer {
-                    return Err(format!("{}: missing Unity shader type trees", file.rel));
-                }
-                plain.push((i, result));
-            }
-        }
-    }
-    // Deferred Unity scans keep their original file order at the merge.
-    plain.sort_by_key(|(i, _)| *i);
-    results.extend(plain.into_iter().map(|(_, result)| result));
-    let output = records::build(&profile, &results).map_err(|e| e.to_string())?;
-    compile_packages(output, notes, ios)
+    Ok((results, common))
 }
 
-fn compile_packages(
-    output: records::Outputs,
-    mut notes: Vec<String>,
-    ios: bool,
-) -> Result<Vec<(String, Vec<u8>)>> {
-    if output.rows.len() > SHADER_LIMIT {
-        return Err("too many discovered shaders".into());
+fn run_workers<T: Send>(
+    threads: usize,
+    count: usize,
+    f: impl Fn(usize) -> Result<T> + Sync,
+) -> Result<Vec<T>> {
+    if count == 0 {
+        return Ok(Vec::new());
     }
+    let workers = threads.max(1).min(count);
+    if workers == 1 {
+        return (0..count).map(f).collect();
+    }
+    let slots: Vec<Mutex<Option<Result<T>>>> = (0..count).map(|_| Mutex::new(None)).collect();
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= count {
+                        break;
+                    }
+                    let r = f(i);
+                    if let Ok(mut g) = slots[i].lock() {
+                        *g = Some(r);
+                    }
+                }
+            });
+        }
+    });
+    slots
+        .into_iter()
+        .map(|s| {
+            s.into_inner()
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| Err("worker failed to produce result".into()))
+        })
+        .collect()
+}
+
+mod discover;
+#[cfg(test)]
+pub(super) use discover::discover;
+pub(super) use discover::discover_dir;
+
+struct PreparedJobs {
+    jobs: Vec<Work>,
+    pairs: BTreeSet<(String, String)>,
+    tables: Vec<NamedFile>,
+}
+
+fn prepare_jobs(output: records::Outputs, notes: &mut Vec<String>) -> Result<PreparedJobs> {
     let mut jobs = Vec::new();
     let mut offsets = BTreeMap::new();
     for (package, index, _, key, _) in &output.rows {
@@ -266,6 +311,12 @@ fn compile_packages(
         jobs.push(work(&job.json, job.code, format!("{package}#{index}"))?);
         offsets.insert(package, start + end);
     }
+    let mut seen = BTreeSet::new();
+    for entry in &jobs {
+        if !seen.insert(&entry.job.key) {
+            return Err(format!("duplicate shader key {}", entry.job.key));
+        }
+    }
     let pairs_text = |pairs: &BTreeSet<(String, String)>| {
         pairs
             .iter()
@@ -295,9 +346,82 @@ fn compile_packages(
         ),
     ];
     let pairs = output.pairs.union(&output.pso_pairs).cloned().collect();
-    compile(jobs, &pairs, tables, notes, ios)
+    Ok(PreparedJobs {
+        jobs,
+        pairs,
+        tables,
+    })
 }
 
+fn compile_work(
+    entry: &Work,
+    chain: &str,
+    pairs: &BTreeSet<(String, String)>,
+    inputs: &BTreeMap<String, StageInputs>,
+    ios: bool,
+) -> Result<(StageInputs, Vec<NamedFile>)> {
+    let key = &entry.job.key;
+    let partners = pairs
+        .iter()
+        .filter(|(v, _)| v == key)
+        .filter_map(|(_, p)| inputs.get(p).cloned())
+        .collect::<Vec<_>>();
+    let ctx = msl::Context {
+        chain,
+        source: entry.source.clone(),
+        partners: &partners,
+        no_facts: entry.no_facts,
+        ..Default::default()
+    };
+    let translated = msl::translate(&entry.job, &entry.code, &ctx)
+        .map_err(|e| format!("shader {key}: {}: {}", e.reason, e.detail))?;
+    let mut files = Vec::new();
+    for lib in translated.libraries {
+        let stem = format!("shaders/{key}{}", lib.suffix);
+        let mut metallib = compile_raw(lib.msl.as_bytes(), ios)
+            .map_err(|e| format!("shader {key}{} compilation: {e:?}", lib.suffix))?;
+        if lib.suffix == "_b"
+            && let Some(side) = &translated.side
+        {
+            let names = side
+                .alpha
+                .iter()
+                .chain(&side.logic)
+                .cloned()
+                .collect::<Vec<_>>();
+            if !names.is_empty() {
+                let (base, side) =
+                    nxb_shader::side::cut(&metallib, &names).map_err(|e| e.to_string())?;
+                metallib = base;
+                files.push(file(format!("shaders/{key}_bx.metallib"), &side));
+            }
+        }
+        files.push(file(format!("{stem}.metal"), lib.msl.as_bytes()));
+        files.push(file(format!("{stem}.metallib"), &metallib));
+        if let Some(reflection) = lib.reflection {
+            files.push(file(
+                format!("{stem}.json"),
+                dumps(&reflection.to_value()).as_bytes(),
+            ));
+        }
+    }
+    Ok((translated.inputs, files))
+}
+
+#[cfg(test)]
+fn compile_packages(
+    output: records::Outputs,
+    mut notes: Vec<String>,
+    ios: bool,
+) -> Result<Vec<(String, Vec<u8>)>> {
+    if output.rows.len() > SHADER_LIMIT {
+        return Err("too many discovered shaders".into());
+    }
+    let prepared = prepare_jobs(output, &mut notes)?;
+    compile(prepared.jobs, &prepared.pairs, prepared.tables, notes, ios)
+}
+
+#[cfg(test)]
 fn compile(
     mut jobs: Vec<Work>,
     pairs: &BTreeSet<(String, String)>,
@@ -320,51 +444,9 @@ fn compile(
     let chain = nxb_shader::chain::standalone_version();
     let mut inputs = BTreeMap::<String, StageInputs>::new();
     for entry in jobs {
-        let key = &entry.job.key;
-        let partners = pairs
-            .iter()
-            .filter(|(v, _)| v == key)
-            .filter_map(|(_, p)| inputs.get(p).cloned())
-            .collect::<Vec<_>>();
-        let ctx = msl::Context {
-            chain: &chain,
-            source: entry.source,
-            partners: &partners,
-            no_facts: entry.no_facts,
-            ..Default::default()
-        };
-        let translated = msl::translate(&entry.job, &entry.code, &ctx)
-            .map_err(|e| format!("shader {key}: {}: {}", e.reason, e.detail))?;
-        inputs.insert(key.clone(), translated.inputs);
-        for lib in translated.libraries {
-            let stem = format!("shaders/{key}{}", lib.suffix);
-            let mut metallib = compile_raw(lib.msl.as_bytes(), ios)
-                .map_err(|e| format!("shader {key}{} compilation: {e:?}", lib.suffix))?;
-            if lib.suffix == "_b"
-                && let Some(side) = &translated.side
-            {
-                let names = side
-                    .alpha
-                    .iter()
-                    .chain(&side.logic)
-                    .cloned()
-                    .collect::<Vec<_>>();
-                if !names.is_empty() {
-                    let (base, side) =
-                        nxb_shader::side::cut(&metallib, &names).map_err(|e| e.to_string())?;
-                    metallib = base;
-                    files.push(file(format!("shaders/{key}_bx.metallib"), &side));
-                }
-            }
-            files.push(file(format!("{stem}.metal"), lib.msl.as_bytes()));
-            files.push(file(format!("{stem}.metallib"), &metallib));
-            if let Some(reflection) = lib.reflection {
-                files.push(file(
-                    format!("{stem}.json"),
-                    dumps(&reflection.to_value()).as_bytes(),
-                ));
-            }
-        }
+        let (stage_inputs, out_files) = compile_work(&entry, &chain, pairs, &inputs, ios)?;
+        inputs.insert(entry.job.key, stage_inputs);
+        files.extend(out_files);
     }
     if !notes.is_empty() {
         files.push(file("shaders/warnings.txt", notes.join("\n").as_bytes()));
@@ -388,137 +470,4 @@ fn compile_raw(_msl: &[u8], _ios: bool) -> Result<Vec<u8>> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[cfg(feature = "air-front")]
-    #[allow(
-        dead_code,
-        reason = "the staged translator test uses the other record cases"
-    )]
-    mod fixture {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../nxb-stages/tests/domain_job/fixture.rs"
-        ));
-    }
-
-    #[cfg(feature = "air-front")]
-    #[test]
-    fn encoded_direct_patch_records_use_normal_standalone_packaging() {
-        const CONTROL_SIZE_FIELD: std::ops::Range<usize> = 0x28..0x2c;
-        const CODE_SIZE_FIELD: std::ops::Range<usize> = 0x2c..0x30;
-        const NVN1_CODE_PREFIX_BYTES: u32 = 0x30;
-        let mut output = records::Outputs::default();
-        for (name, stage, key, code) in [
-            (
-                "vs_cloud.bin",
-                "vs",
-                "0101010101010101",
-                fixture::vs_capture(),
-            ),
-            (
-                "ds_cloud.bin",
-                "ds",
-                "0303030303030303",
-                fixture::ds_partial_x(),
-            ),
-            (
-                "ps_cloud.bin",
-                "ps",
-                "0202020202020202",
-                fixture::fs_xyzw(0),
-            ),
-            (
-                "ps_cloud.bin",
-                "ps",
-                "0404040404040404",
-                fixture::fs_xyzw(1),
-            ),
-        ] {
-            let mut record = fixture::record(&code);
-            record[..8].copy_from_slice(b"BTCDBTCD");
-            record[CONTROL_SIZE_FIELD]
-                .copy_from_slice(&(fixture::CONTROL_LEN as u32).to_le_bytes());
-            record[CODE_SIZE_FIELD]
-                .copy_from_slice(&(NVN1_CODE_PREFIX_BYTES + code.len() as u32).to_le_bytes());
-            output
-                .packages
-                .entry(name.into())
-                .or_default()
-                .extend(record);
-            let previous = usize::from(key == "0404040404040404");
-            output
-                .rows
-                .push((name.into(), previous, stage, key.into(), "synthetic".into()));
-        }
-        // The normal standalone builder consumes the same package bytes and map rows
-        // as after discovery. No supplied MSL, resource facts, or guessed pair table.
-        let files: BTreeMap<_, _> = compile_packages(output, vec![], false)
-            .unwrap()
-            .into_iter()
-            .collect();
-        for key in [
-            "0101010101010101",
-            "0202020202020202",
-            "0303030303030303",
-            "0404040404040404",
-        ] {
-            let base = format!("shaders/{key}_b");
-            assert!(files[&format!("{base}.metallib")].starts_with(b"MTLB"));
-            let json = std::str::from_utf8(&files[&format!("{base}.json")]).unwrap();
-            let reflection = parse(json).unwrap();
-            let stage = match key {
-                "0101010101010101" => "vs",
-                "0303030303030303" => "ds",
-                _ => "ps",
-            };
-            assert_eq!(
-                reflection.get("stage").and_then(J::as_str),
-                Some(stage),
-                "{base}"
-            );
-            assert_eq!(
-                reflection.get("entry").and_then(J::as_str),
-                Some("main0"),
-                "{base}"
-            );
-        }
-    }
-
-    #[test]
-    fn rejects_unsafe_names_and_oversized_nso() {
-        assert!(safe_name("../main").is_err());
-        assert!(safe_name("main").is_ok());
-        assert!(check_nso_size(b"NSO0").is_err());
-        let mut nso = vec![0; 0x40];
-        nso[..4].copy_from_slice(b"NSO0");
-        nso[0x18..0x1c].copy_from_slice(&((INPUT_LIMIT as u32) + 1).to_le_bytes());
-        assert!(check_nso_size(&nso).is_err());
-    }
-    #[test]
-    fn incomplete_discovery_does_not_produce_a_successful_shader_stage() {
-        let result = compile(
-            vec![],
-            &BTreeSet::new(),
-            vec![],
-            vec!["[RED] /content.pak: its shaders are left out".into()],
-            false,
-        );
-        assert!(
-            result
-                .unwrap_err()
-                .starts_with("unsupported: incomplete shader discovery")
-        );
-    }
-
-    #[test]
-    fn empty_discovery_produces_tables() {
-        let files = discover(&[], &[], false).unwrap();
-        assert!(
-            files
-                .iter()
-                .any(|(name, _)| name == "shaders/shader_map.tsv")
-        );
-        assert!(!files.iter().any(|(name, _)| name.ends_with(".metallib")));
-    }
-}
+mod tests;

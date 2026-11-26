@@ -146,6 +146,139 @@ fn a_counter_only_the_gpu_knows_renders() {
     run(&mut rc, &mut f, &s, &[(0x100, 0), (0x110, 0)]);
     assert!(skipped(&f).is_empty());
     assert_eq!(rc.take_stats().unknown, 1);
+    assert_eq!(f.gpu_cond(0), None);
+    assert_eq!(
+        f.gpu_cond(1),
+        Some(crate::frame::GpuCond {
+            mode: RENDER_IF_NOT_EQUAL,
+            a: crate::frame::CondOperand::SameFrameWrite(0),
+            b: crate::frame::CondOperand::Const(0),
+        })
+    );
+}
+
+#[test]
+fn gpu_cond_clears_on_render_enable_and_skips_non_samples_or_forced() {
+    use crate::frame::{CondOperand, GpuCond};
+    let (mut rc, mut f) = (RenderConds::new(), Frame::new());
+    let s = stream(
+        4,
+        &[
+            (
+                1,
+                MarkOp::ReportCounter {
+                    addr: 0x100,
+                    kind: crate::counters::SAMPLES_PASSED,
+                },
+            ),
+            (
+                1,
+                MarkOp::RenderIf {
+                    mode: RENDER_IF_NOT_EQUAL,
+                    addr: 0x100,
+                },
+            ),
+            (2, MarkOp::RenderEnable(true)),
+            (
+                2,
+                MarkOp::ReportCounter {
+                    addr: 0x200,
+                    kind: crate::counters::INPUT_VERTICES,
+                },
+            ),
+            (
+                3,
+                MarkOp::RenderIf {
+                    mode: RENDER_IF_NOT_EQUAL,
+                    addr: 0x200,
+                },
+            ),
+        ],
+    );
+    run(&mut rc, &mut f, &s, &[(0x110, 0), (0x210, 0)]);
+    assert_eq!(
+        f.gpu_cond(1),
+        Some(GpuCond {
+            mode: RENDER_IF_NOT_EQUAL,
+            a: CondOperand::SameFrameWrite(0),
+            b: CondOperand::Const(0),
+        })
+    );
+    assert_eq!(f.gpu_cond(2), None);
+    assert_eq!(f.gpu_cond(3), None);
+
+    // Forced `rcall` overrides unknown evaluation and emits no GpuCond.
+    let (mut rc, mut f) = (RenderConds::new(), Frame::new());
+    let base = f.cmds.len() as u32;
+    f.append(&s);
+    rc.apply_with(
+        Q,
+        base,
+        &s.marks,
+        &mut f,
+        |a| (a == 0x110).then_some(0),
+        force::RCALL,
+    );
+    assert_eq!(f.gpu_cond(1), None);
+}
+
+#[test]
+fn gpu_cond_persists_across_submits_until_flushed() {
+    let mut rc = RenderConds::new();
+    let mut f = Frame::new();
+    let base1 = f.cmds.len() as u32;
+    let s1 = stream(
+        1,
+        &[
+            (0, MarkOp::ResetCounter { kind: 1 }),
+            (
+                0,
+                MarkOp::ReportCounter {
+                    addr: 0x100,
+                    kind: 1,
+                },
+            ),
+            (
+                1,
+                MarkOp::ReportCounter {
+                    addr: 0x200,
+                    kind: 1,
+                },
+            ),
+            (
+                1,
+                MarkOp::RenderIf {
+                    mode: RENDER_IF_NOT_EQUAL,
+                    addr: 0x200,
+                },
+            ),
+        ],
+    );
+    f.append(&s1);
+    rc.apply_with(
+        Q,
+        base1,
+        &s1.marks,
+        &mut f,
+        |a| (a == 0x210).then_some(0),
+        0,
+    );
+
+    // Second submit with no marks inherits the open queue GpuCond.
+    let base2 = f.cmds.len() as u32;
+    let s2 = stream(2, &[]);
+    f.append(&s2);
+    rc.apply_with(Q, base2, &s2.marks, &mut f, |_| None, 0);
+    assert!(f.gpu_cond(base2).is_some());
+    assert!(f.gpu_cond(base2 + 1).is_some());
+
+    // Flushing clears active per-queue GpuCond for the next frame.
+    rc.flushed();
+    let mut f2 = Frame::new();
+    let s3 = stream(1, &[]);
+    f2.append(&s3);
+    rc.apply_with(Q, 0, &s3.marks, &mut f2, |_| None, 0);
+    assert_eq!(f2.gpu_cond(0), None);
 }
 
 #[test]

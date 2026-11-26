@@ -2,6 +2,49 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use super::*;
 use crate::{extract_fixture as common, nup_fixture as nup};
+use std::collections::BTreeMap;
+fn read_tree(root: &Path, prefix: &str, overlay: Option<&Path>) -> Vec<(String, Vec<u8>)> {
+    let mut out = BTreeMap::new();
+    let mut scan = |base: &Path, skip_stamp: bool| {
+        if !base.is_dir() {
+            return;
+        }
+        let mut stack = vec![PathBuf::new()];
+        while let Some(rel) = stack.pop() {
+            for e in std::fs::read_dir(base.join(&rel)).unwrap() {
+                let e = e.unwrap();
+                let r = rel.join(e.file_name());
+                let name = r.to_string_lossy().replace('\\', "/");
+                if skip_stamp && name == crate::resource_patch::STAMP {
+                    continue;
+                }
+                if e.file_type().unwrap().is_dir() {
+                    stack.push(r);
+                } else {
+                    out.insert(format!("{prefix}/{name}"), std::fs::read(e.path()).unwrap());
+                }
+            }
+        }
+    };
+    scan(root, false);
+    if let Some(o) = overlay {
+        scan(o, true);
+    }
+    out.into_iter().collect()
+}
+
+fn all_files(game: &Extracted) -> Vec<(String, Vec<u8>)> {
+    let mut out = game.files.clone();
+    if let Some(romfs) = &game.romfs_dir {
+        out.extend(read_tree(romfs, "romfs", game.romfs_overlay.as_deref()));
+    }
+    for (index, dir) in &game.aoc_dirs {
+        out.extend(read_tree(dir, &format!("aoc/{index}"), None));
+    }
+    out.sort();
+    out
+}
+
 fn compressed_program(nca: &[u8], plain: &[common::Plain]) -> Vec<u8> {
     let mut out = nca[..0x4000].to_vec();
     out.extend_from_slice(b"NCZSECTN");
@@ -86,7 +129,8 @@ fn packages_ncz_separate_updates_and_dlc_share_the_extractor() {
     for path in [nsz, xci, xcz] {
         args.nsp_dir = path;
         let game = extract(&args, &progress).unwrap();
-        assert_eq!(original.files, game.files);
+        assert_eq!(all_files(&original), all_files(&game));
+        assert_eq!(original.romfs_paths, game.romfs_paths);
         assert_eq!(original.title_id, game.title_id);
     }
     args.update_inputs.push(updates);
@@ -97,15 +141,14 @@ fn packages_ncz_separate_updates_and_dlc_share_the_extractor() {
         updated.modules,
         vec![("main".into(), b"NSO0patched".to_vec())]
     );
+    let updated_files = all_files(&updated);
     assert!(
-        updated
-            .files
+        updated_files
             .iter()
             .any(|(n, bytes)| n == "romfs/small.txt" && bytes == b"tag 1")
     );
     assert!(
-        updated
-            .files
+        updated_files
             .iter()
             .any(|(n, bytes)| n == "aoc/1/extra" && bytes == b"dlc")
     );
@@ -166,12 +209,11 @@ fn check_dlc(game: &Extracted, app: u64, version: u32, bytes: &[u8]) {
     assert_eq!(game.aoc[0].index, 1);
     assert_eq!(game.aoc[0].version, version);
     assert_eq!(game.aoc[0].path, "aoc/1");
-    let files: Vec<_> = game
-        .files
-        .iter()
+    let files: Vec<_> = all_files(game)
+        .into_iter()
         .filter(|(n, _)| n.starts_with("aoc/"))
         .collect();
-    assert_eq!(files, vec![&("aoc/1/extra".into(), bytes.to_vec())]);
+    assert_eq!(files, vec![("aoc/1/extra".into(), bytes.to_vec())]);
 }
 
 #[test]
@@ -211,11 +253,18 @@ fn nup_base_selects_newest_embedded_or_external_dlc() {
         vec![("main".into(), b"NSO0base".to_vec())]
     );
     assert_eq!(original.aoc[0].version, 2);
-    assert!(original.files.iter().any(|(n, _)| n == "aoc/1/removed"));
+    assert!(
+        all_files(&original)
+            .iter()
+            .any(|(n, _)| n == "aoc/1/removed")
+    );
     let old = dir.join("old.nsp");
     std::fs::write(&old, dlc_package(APP + 0x1001, 1, b"old", false)).unwrap();
     args.aoc.push(old);
-    assert_eq!(extract(&args, &progress).unwrap().files, original.files);
+    assert_eq!(
+        all_files(&extract(&args, &progress).unwrap()),
+        all_files(&original)
+    );
     for (version, extension, compressed) in [
         (3, "nsp", false),
         (4, "nsz", true),
@@ -235,7 +284,7 @@ fn nup_base_selects_newest_embedded_or_external_dlc() {
         let game = extract(&args, &progress).unwrap();
         check_dlc(&game, APP, version, &bytes);
         assert!(
-            game.files
+            all_files(&game)
                 .iter()
                 .any(|(n, b)| n == "romfs/base" && b == b"base")
         );
@@ -375,8 +424,9 @@ fn standalone_nup_updates_replace_either_base_and_merge_dlc() {
             assert_eq!(game.title_id, APP);
             assert_eq!(game.version, 131072);
             assert_eq!(game.modules, vec![("main".into(), b"NSO0latest".to_vec())]);
+            let files = all_files(&game);
             assert!(
-                game.files
+                files
                     .iter()
                     .any(|(n, b)| n == "romfs/data" && b == b"NSO0latest")
             );
@@ -393,7 +443,7 @@ fn standalone_nup_updates_replace_either_base_and_merge_dlc() {
                 (3, b"retained DLC"),
             ] {
                 assert!(
-                    game.files
+                    files
                         .iter()
                         .any(|(n, b)| n == &format!("aoc/{index}/extra") && b == bytes)
                 );

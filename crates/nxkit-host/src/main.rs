@@ -33,6 +33,52 @@ fn bundled_run_folder(executable: &std::path::Path) -> Result<std::path::PathBuf
     Ok(root)
 }
 
+/// Filters out macOS LaunchServices and Cocoa defaults flags from the argument list.
+#[cfg(any(target_os = "macos", test))]
+fn filter_launch_args(args: &[String]) -> Vec<&str> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg.starts_with("-psn_") {
+            i += 1;
+            continue;
+        }
+        if arg.starts_with("-NS") || arg.starts_with("-Apple") {
+            i += 1;
+            if let Some(next) = args.get(i).map(String::as_str) {
+                let is_value_token = !next.starts_with('-')
+                    && next != "probe"
+                    && next != "home-preview"
+                    && !next.contains('/')
+                    && !std::path::Path::new(next).is_dir();
+                if is_value_token {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        out.push(arg);
+        i += 1;
+    }
+    out
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_bundled_run_folder_or_exit(usage: &str) -> std::path::PathBuf {
+    match std::env::current_exe()
+        .map_err(|e| format!("Cannot locate nxkit-host: {e}"))
+        .and_then(|executable| bundled_run_folder(&executable))
+    {
+        Ok(root) => root,
+        Err(e) => {
+            eprintln!("nxkit-host: {e}\n{usage}");
+            nxkit_host::stop::log_error(&e);
+            std::process::exit(64);
+        }
+    }
+}
+
 /// The allocator with the spy of `NXKIT_MEM_ALLOC` (see `docs/diagnostics.md`).
 #[cfg(target_os = "macos")]
 #[global_allocator]
@@ -45,34 +91,22 @@ fn main() {
     use nxkit_host::run::Options;
 
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let filtered = filter_launch_args(&args);
     let usage = "usage: nxkit-host [--fullscreen] <run folder>\n       nxkit-host probe <run folder>\n       \
          nxkit-host home-preview <folder>\n       nxkit-host --save-sync-report[=<ms>] [<run folder>]\n       \
          nxkit-host --save-sync-send [<run folder>]";
-    if let Some(code) = save_sync(&args, usage) {
+    if let Some(code) = save_sync(&filtered, usage) {
         std::process::exit(code);
     }
-    let result = match args
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .as_slice()
-    {
-        [] => {
-            let root = std::env::current_exe()
-                .map_err(|e| format!("Cannot locate nxkit-host: {e}"))
-                .and_then(|executable| bundled_run_folder(&executable));
-            let root = match root {
-                Ok(root) => root,
-                Err(e) => {
-                    eprintln!("nxkit-host: {e}\n{usage}");
-                    std::process::exit(64);
-                }
-            };
-            nxkit_host::run::run(&Options {
-                root,
-                fullscreen: false,
-            })
-        }
+    let result = match filtered.as_slice() {
+        [] => nxkit_host::run::run(&Options {
+            root: resolve_bundled_run_folder_or_exit(usage),
+            fullscreen: false,
+        }),
+        ["--fullscreen"] => nxkit_host::run::run(&Options {
+            root: resolve_bundled_run_folder_or_exit(usage),
+            fullscreen: true,
+        }),
         ["probe", root] => nxkit_host::probe::run(&PathBuf::from(*root)),
         ["home-preview", dir] => match nxkit_host::sys::homepreview::run(&PathBuf::from(*dir)) {
             Ok(files) => {
@@ -98,6 +132,7 @@ fn main() {
         }
         _ => {
             eprintln!("{usage}");
+            nxkit_host::stop::log_error(&format!("invalid arguments: {filtered:?}"));
             std::process::exit(64);
         }
     };
@@ -110,15 +145,15 @@ fn main() {
 /// The cloud save entries: `--save-sync-report[=<ms>]` prints the report line, `--save-sync-send` sends what the game
 /// left. Both use the run folder of the bundle unless one is given. `None` for other arguments.
 #[cfg(target_os = "macos")]
-fn save_sync(args: &[String], usage: &str) -> Option<i32> {
+fn save_sync(args: &[&str], usage: &str) -> Option<i32> {
     use std::path::PathBuf;
-    let first = args.first()?;
+    let first = *args.first()?;
     let report = first.strip_prefix("--save-sync-report");
     if report.is_none() && first != "--save-sync-send" {
         return None;
     }
     let root = match args.get(1..) {
-        Some([root]) => Ok(PathBuf::from(root)),
+        Some([root]) => Ok(PathBuf::from(*root)),
         Some([]) => std::env::current_exe()
             .map_err(|e| format!("Cannot locate nxkit-host: {e}"))
             .and_then(|executable| bundled_run_folder(&executable)),
@@ -128,6 +163,11 @@ fn save_sync(args: &[String], usage: &str) -> Option<i32> {
         Ok(r) => r,
         Err(e) => {
             eprintln!("nxkit-host: {e}\n{usage}");
+            nxkit_host::stop::log_error(if e.is_empty() {
+                "invalid save-sync arguments"
+            } else {
+                &e
+            });
             return Some(64);
         }
     };
@@ -140,6 +180,7 @@ fn save_sync(args: &[String], usage: &str) -> Option<i32> {
             }
             None => {
                 eprintln!("{usage}");
+                nxkit_host::stop::log_error(&format!("invalid arguments: {args:?}"));
                 64
             }
         },
@@ -155,8 +196,66 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::bundled_run_folder;
+    use super::{bundled_run_folder, filter_launch_args};
     use std::path::Path;
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn filters_launch_services_and_cocoa_defaults_flags() {
+        let args = strings(&["-psn_0_12345"]);
+        assert!(filter_launch_args(&args).is_empty());
+
+        let args = strings(&[
+            "-psn_0_12345",
+            "-NSDocumentRevisionsDebugMode",
+            "YES",
+            "-AppleTextDirection",
+            "YES",
+            "--fullscreen",
+        ]);
+        assert_eq!(filter_launch_args(&args), vec!["--fullscreen"]);
+
+        let args = strings(&[
+            "-NSDocumentRevisionsDebugMode",
+            "YES",
+            "probe",
+            "/path/to/run",
+        ]);
+        assert_eq!(filter_launch_args(&args), vec!["probe", "/path/to/run"]);
+
+        let args = strings(&["-psn_0_12345", "probe", "/path/to/run"]);
+        assert_eq!(filter_launch_args(&args), vec!["probe", "/path/to/run"]);
+
+        let args = strings(&[
+            "-AppleLanguages",
+            "(en)",
+            "-NSDocumentRevisionsDebugMode",
+            "--fullscreen",
+            "/path/to/run",
+        ]);
+        assert_eq!(
+            filter_launch_args(&args),
+            vec!["--fullscreen", "/path/to/run"]
+        );
+
+        let args = strings(&["-NSDocumentRevisionsDebugMode", "probe", "/path/to/run"]);
+        assert_eq!(filter_launch_args(&args), vec!["probe", "/path/to/run"]);
+
+        let args = strings(&["-AppleTextDirection", "home-preview", "/tmp/dir"]);
+        assert_eq!(filter_launch_args(&args), vec!["home-preview", "/tmp/dir"]);
+
+        let args = strings(&["-NSDocumentRevisionsDebugMode", "/path/to/run"]);
+        assert_eq!(filter_launch_args(&args), vec!["/path/to/run"]);
+
+        let args = strings(&["-NSDocumentRevisionsDebugMode", "."]);
+        assert_eq!(filter_launch_args(&args), vec!["."]);
+
+        let args = strings(&["-AppleTextDirection"]);
+        assert!(filter_launch_args(&args).is_empty());
+    }
 
     #[test]
     fn rejects_paths_outside_generated_bundles() {

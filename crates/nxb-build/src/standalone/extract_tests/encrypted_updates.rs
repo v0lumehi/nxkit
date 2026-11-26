@@ -50,7 +50,7 @@ fn encrypted_code_only_update_preserves_nup_romfs_and_dlc() {
     assert_eq!(game.version, 65536);
     assert_eq!(game.modules, vec![("main".into(), b"NSO0patched".to_vec())]);
     assert!(
-        game.files
+        all_files(&game)
             .iter()
             .any(|(n, b)| n == "romfs/data" && b == b"NSO0original")
     );
@@ -71,7 +71,7 @@ fn encrypted_code_only_update_preserves_nup_romfs_and_dlc() {
     let cumulative = extract(&args, &progress).unwrap();
     assert_eq!(cumulative.version, game.version);
     assert_eq!(cumulative.modules, game.modules);
-    assert_eq!(cumulative.files, game.files);
+    assert_eq!(all_files(&cumulative), all_files(&game));
     // An update-only NUP does not retain the original base bytes needed by this patch.
     args.nsp_dir = nup_base(&dir, app, 32768);
     assert!(
@@ -107,13 +107,9 @@ fn encrypted_bktr_update_requires_matching_base_package() {
     args.base_package = Some(backing.clone());
     let game = extract(&args, &progress).unwrap();
     assert_eq!(game.version, 65536);
-    let mut romfs: Vec<_> = game
-        .files
-        .iter()
-        .filter_map(|(name, bytes)| {
-            name.strip_prefix("romfs")
-                .map(|n| (n.to_string(), bytes.clone()))
-        })
+    let mut romfs: Vec<_> = all_files(&game)
+        .into_iter()
+        .filter_map(|(name, bytes)| name.strip_prefix("romfs").map(|n| (n.to_string(), bytes)))
         .collect();
     romfs.sort();
     assert_eq!(romfs, fixture.image);

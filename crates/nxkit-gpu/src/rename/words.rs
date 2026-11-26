@@ -130,16 +130,32 @@ pub(super) fn read_packed(
         prefix.push(total);
         total += m.count_ones();
     }
+    if total == 0 {
+        return Some((vals, prefix));
+    }
+    vals.reserve(total as usize);
     let n = mask.len() * 32;
     let mut w = 0;
     while w < n {
-        if mask[w / 32] >> (w % 32) & 1 == 0 {
-            w += 1;
+        let word = mask[w / 32] >> (w % 32);
+        if word == 0 {
+            w = (w / 32 + 1) * 32;
             continue;
         }
+        w += word.trailing_zeros() as usize;
+        if w >= n {
+            break;
+        }
         let first = w;
-        while w < n && mask[w / 32] >> (w % 32) & 1 != 0 {
-            w += 1;
+        while w < n {
+            let cur = mask[w / 32] >> (w % 32);
+            let ones = (!cur).trailing_zeros() as usize;
+            let rem = 32 - (w % 32);
+            if ones < rem {
+                w = (w + ones).min(n);
+                break;
+            }
+            w = (w + rem).min(n);
         }
         let mut bytes = vec![0u8; 4 * (w - first)];
         if !read(addr + 4 * first as u64, &mut bytes) {

@@ -411,6 +411,8 @@ pub(super) fn draw(
         d,
         &mut ScratchSink::new(scratch, sh.uploaded, Some(memo)).with_preloaded(sh.preloaded),
         false,
+        pre.cond_indirect.get(&n).copied(),
+        pre.cond_mesh.contains(&n),
     );
     if crate::diag("pixel") && crate::diag::sampled() && FOCUS_PASS.with(std::cell::Cell::get) {
         static SHOWN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -460,6 +462,39 @@ pub(super) fn draw(
             }
         }
         Err(_) => stats.skip_draw(Some(&d.args), Skip::Encode),
+    }
+}
+
+/// Encodes draw `n` with visibility sample counting when active on the pass.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn draw_counted(
+    sh: &EncodeCtx<'_>,
+    pc: &PassCtx,
+    rp: &mut RenderPass<'_>,
+    tr: &mut Tracker,
+    scratch: &Scratch,
+    memo: &mut ArgsMemo,
+    pre: &Prepass,
+    object: &ArgumentTable,
+    vis: Option<&(&crate::queries::FrameQueries, crate::queries::PassVis<'_>)>,
+    counts: &dyn Fn(u32) -> Option<u64>,
+    counting: &mut Option<u64>,
+    n: u32,
+    stats: &mut EncodeStats,
+) {
+    let want = counts(n);
+    let counted = vis.is_some() && super::set_counting(rp, counting, want, stats);
+    let before = stats.draws;
+    draw(sh, pc, rp, tr, scratch, memo, pre, object, n, stats);
+    if counted
+        && want.is_some()
+        && stats.draws > before
+        && let Some((q, _)) = vis
+    {
+        if let Some(slot) = q.draw_slot(n) {
+            q.encoded(slot);
+        }
+        q.mesh_encoded(n);
     }
 }
 

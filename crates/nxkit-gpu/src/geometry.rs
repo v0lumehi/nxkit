@@ -10,8 +10,10 @@ use nxkit_metal::{IndexType, Primitive};
 
 use crate::bindless::Sink;
 use crate::detail::{DrawArgs, DrawDetail, StreamDetail};
-use crate::drawctx::{Geom, Shared};
-use crate::pools::{Backing, Loc, Miss, PoolSnapshot};
+use crate::drawctx::{Geom, Shared, pool_miss as why};
+#[cfg(test)]
+pub(crate) use crate::drawctx::{indirect_args, word_loc};
+use crate::pools::{Backing, Loc, PoolSnapshot};
 use crate::skip::Skip;
 use crate::translate;
 
@@ -19,16 +21,7 @@ use crate::translate;
 mod tests;
 
 /// The most draws of one multi-draw that the pre-pass copies. The rest are left out and counted.
-pub(crate) const MAX_MULTI: u32 = 4096;
-
-/// Why a range did not resolve, for the line of a skip.
-fn why(miss: Miss) -> String {
-    match miss {
-        Miss::NoPool => "in no pool".into(),
-        Miss::CrossesEdge { pool_end } => format!("crosses the end of its pool at {pool_end:#x}"),
-        Miss::NoBuffer => "its pool has no buffer".into(),
-    }
-}
+pub(crate) use crate::detail::MAX_MULTI;
 
 /// Where the vertex stream `s` starts. Only the start must lie in a pool: the size of a stream is an upper bound, and
 /// the draw reads what its vertices reach, so a stream longer than its pool is clamped to the pool's `room`.
@@ -70,38 +63,6 @@ pub(crate) fn index_loc<B: Backing>(
         })
 }
 
-/// Where `bytes` at `addr` lie when the GPU reads them as words: a 4 byte aligned guest address and real address in
-/// one pool. The error is the reason.
-pub(crate) fn word_loc<B: Backing>(
-    pools: &PoolSnapshot<B>,
-    addr: u64,
-    bytes: u64,
-) -> Result<Loc, String> {
-    if !addr.is_multiple_of(4) {
-        return Err("not 4 byte aligned".into());
-    }
-    let loc = pools
-        .resolve_c(addr, bytes, crate::pools::overlay::STREAM)
-        .map_err(why)?;
-    if !loc.real.is_multiple_of(4) {
-        return Err(format!("real address {:#x} not 4 byte aligned", loc.real));
-    }
-    Ok(loc)
-}
-
-/// Checks that `bytes` of indirect arguments at `addr` lie in one pool at a 4 byte aligned address.
-pub(crate) fn indirect_args<B: Backing>(
-    pools: &PoolSnapshot<B>,
-    addr: u64,
-    bytes: u64,
-) -> Result<Loc, Skip> {
-    word_loc(pools, addr, bytes).map_err(|w| {
-        crate::buf_skip(format_args!(
-            "indirect arguments addr {addr:#x} bytes {bytes}: {w}"
-        ))
-    })
-}
-
 /// Where the index buffer at `addr` starts, and the bytes from there to the end of its pool. An indirect draw takes its
 /// index count from the GPU, so the encoder gives Metal all of the pool. Metal reads an index past it as 0.
 pub(crate) fn index_room<B: Backing>(
@@ -119,6 +80,7 @@ pub(crate) fn geometry(
     d: &DrawDetail,
     primitive: Primitive,
     sink: &mut dyn Sink,
+    cond_indirect: Option<u64>,
 ) -> Result<(Geom, u32), Skip> {
     if d.topology == translate::QUADS {
         return quads(sh, d, sink);
@@ -129,16 +91,28 @@ pub(crate) fn geometry(
             count,
             instances,
             base_instance,
-        } => (
-            Geom::Arrays {
-                primitive,
-                first,
-                count,
-                instances,
-                base_instance,
-            },
-            base_instance,
-        ),
+        } => {
+            if let Some(indirect) = cond_indirect {
+                (
+                    Geom::Indirect {
+                        primitive,
+                        indirect,
+                    },
+                    0,
+                )
+            } else {
+                (
+                    Geom::Arrays {
+                        primitive,
+                        first,
+                        count,
+                        instances,
+                        base_instance,
+                    },
+                    base_instance,
+                )
+            }
+        }
         DrawArgs::Indexed {
             index_type,
             address,
@@ -147,37 +121,57 @@ pub(crate) fn geometry(
             base_vertex,
             base_instance,
         } => {
-            // Metal has no 8-bit indices: the indices are widened to 16 bits into the batch's scratch memory, and the
-            // draw reads them there (NVN_INDEX_TYPE_UNSIGNED_BYTE, Ocarina of Time's interface and movie quads).
-            let (it, address, loc) = if index_type == 0 {
-                let wide = widen_u8_indices(sh, address, count, sink)?;
-                (IndexType::U16, wide, None)
-            } else {
+            if let Some(indirect) = cond_indirect
+                && index_type != 0
+            {
                 let it = translate::index_type(index_type).ok_or(Skip::Index)?;
                 let loc = index_loc(sh.pools, address, count, it.bytes())?;
-                (it, loc.real, Some(loc))
-            };
-            (
-                Geom::Indexed {
-                    primitive,
-                    index_type: it,
-                    address,
-                    loc,
-                    count,
-                    instances,
-                    base_vertex,
+                (
+                    Geom::IndexedIndirect {
+                        primitive,
+                        index_type: it,
+                        address: loc.real,
+                        index_bytes: u64::from(count) * it.bytes(),
+                        indirect,
+                    },
+                    0,
+                )
+            } else {
+                // Metal has no 8-bit indices: the indices are widened to 16 bits into the batch's scratch memory, and the
+                // draw reads them there (NVN_INDEX_TYPE_UNSIGNED_BYTE, Ocarina of Time's interface and movie quads).
+                let (it, address, loc) = if index_type == 0 {
+                    let wide = widen_u8_indices(sh, address, count, sink)?;
+                    (IndexType::U16, wide, None)
+                } else {
+                    let it = translate::index_type(index_type).ok_or(Skip::Index)?;
+                    let loc = index_loc(sh.pools, address, count, it.bytes())?;
+                    (it, loc.real, Some(loc))
+                };
+                (
+                    Geom::Indexed {
+                        primitive,
+                        index_type: it,
+                        address,
+                        loc,
+                        count,
+                        instances,
+                        base_vertex,
+                        base_instance,
+                    },
                     base_instance,
-                },
-                base_instance,
-            )
+                )
+            }
         }
         // The GPU reads the first instance with the arguments, so the driver block of an indirect draw has 0.
         DrawArgs::ArraysIndirect { indirect } => {
-            let at = indirect_args(sh.pools, indirect, 16)?;
+            let real = match cond_indirect {
+                Some(r) => r,
+                None => sh.indirect_real(indirect, 16)?,
+            };
             (
                 Geom::Indirect {
                     primitive,
-                    indirect: at.real,
+                    indirect: real,
                 },
                 0,
             )
@@ -188,7 +182,10 @@ pub(crate) fn geometry(
             indirect,
         } => {
             let it = translate::index_type(index_type).ok_or(Skip::Index)?;
-            let args = indirect_args(sh.pools, indirect, 20)?;
+            let indirect = match cond_indirect {
+                Some(r) => r,
+                None => sh.indirect_real(indirect, 20)?,
+            };
             let (index, index_bytes) = index_room(sh.pools, address)?;
             (
                 Geom::IndexedIndirect {
@@ -196,7 +193,7 @@ pub(crate) fn geometry(
                     index_type: it,
                     address: index.real,
                     index_bytes,
-                    indirect: args.real,
+                    indirect,
                 },
                 0,
             )

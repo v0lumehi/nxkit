@@ -47,8 +47,64 @@ pub fn park_forever() -> ! {
     }
 }
 
+/// Best-effort append of a fatal error line to `~/Library/Logs/nxkit/last-error.log`.
+pub fn log_error(message: &str) {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    log_error_in_home(std::path::Path::new(&home), message);
+}
+
+fn log_error_in_home(home: &std::path::Path, message: &str) {
+    use std::io::Write;
+
+    let dir = home.join("Library/Logs/nxkit");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("last-error.log"))
+    else {
+        return;
+    };
+    let _ = writeln!(file, "nxkit-host: fatal: {message}");
+}
+
 /// Ends the process with an error message. Used where the host cannot go on and cannot return an error (R15).
 pub fn fatal(message: &str) -> ! {
     eprintln!("nxkit-host: fatal: {message}");
+    log_error(message);
     std::process::exit(2);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::log_error_in_home;
+
+    #[test]
+    fn appends_fatal_lines_to_last_error_log() {
+        let temp = std::env::temp_dir().join(format!("nxkit-host-stop-log-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        log_error_in_home(&temp, "first failure");
+        log_error_in_home(&temp, "second failure");
+
+        let log_path = temp.join("Library/Logs/nxkit/last-error.log");
+        let contents = std::fs::read_to_string(&log_path);
+        assert_eq!(
+            contents.ok().as_deref(),
+            Some("nxkit-host: fatal: first failure\nnxkit-host: fatal: second failure\n")
+        );
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn ignores_io_errors_without_panicking() {
+        let temp =
+            std::env::temp_dir().join(format!("nxkit-host-stop-log-err-{}", std::process::id()));
+        assert!(std::fs::write(&temp, "not a directory").is_ok());
+        log_error_in_home(&temp, "should not panic");
+        let _ = std::fs::remove_file(&temp);
+    }
 }

@@ -58,6 +58,7 @@ fn the_kernels_fill_the_copy_and_merge_the_gpu_words_back() {
         fence: 1,
         sampled: false,
         epoch: 0,
+        indirects: Vec::new(),
         ranges: vec![CapRange {
             addr: 0x1000,
             len: 160,
@@ -159,6 +160,7 @@ fn a_probe_writes_back_every_word_that_the_gpu_changed_and_only_those() {
         fence: 1,
         sampled: false,
         epoch: 0,
+        indirects: Vec::new(),
         ranges: vec![CapRange {
             addr: 0x1000,
             len: 160,

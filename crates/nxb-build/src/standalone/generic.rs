@@ -30,23 +30,12 @@ fn put(run: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
     std::fs::write(&path, bytes).map_err(|e| io(&path, e))
 }
 
-// symlink_metadata also sees dangling symlinks, which must never be followed for output.
-fn vacant(path: &Path) -> Result<(), String> {
-    match std::fs::symlink_metadata(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(io(path, e)),
-        Ok(_) => Err(format!("{} exists: choose a new output", path.display())),
-    }
-}
-
 fn publish(partial: &Path, out: &Path) -> Result<(), String> {
-    // Reserve an empty destination atomically. A concurrent build cannot replace another app.
-    std::fs::create_dir(out).map_err(|e| io(out, e))?;
-    if let Err(e) = std::fs::rename(partial, out) {
-        let _ = std::fs::remove_dir(out);
-        return Err(io(out, e));
+    super::replaceable(out)?;
+    if out.exists() {
+        std::fs::remove_dir_all(out).map_err(|e| io(out, e))?;
     }
-    Ok(())
+    std::fs::rename(partial, out).map_err(|e| io(out, e))
 }
 
 pub(super) fn run(a: &Args, p: &Say) -> Result<(), String> {
@@ -62,7 +51,7 @@ pub(super) fn run(a: &Args, p: &Say) -> Result<(), String> {
         return Ok(());
     }
     if let Some(out) = &a.out {
-        vacant(out)?;
+        super::replaceable(out)?;
     }
     p.plan(5);
     let game = stage(p, "extract", "validate application metadata", || {
@@ -75,12 +64,10 @@ pub(super) fn run(a: &Args, p: &Say) -> Result<(), String> {
         .out
         .clone()
         .unwrap_or_else(|| super::home(a).join(format!("{}.app", bundle::file_name(name))));
-    // Never replace an app or its saves in the experimental generic path.
-    vacant(&out)?;
+    super::replaceable(&out)?;
     let mut partial = out.clone().into_os_string();
     partial.push(".partial");
     let partial = std::path::PathBuf::from(partial);
-    vacant(&partial)?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let host = bundle::host(std::env::var("NXB_NXKIT_HOST").ok().as_deref(), &exe)?;
     let id = a
@@ -119,31 +106,7 @@ pub(super) fn run(a: &Args, p: &Say) -> Result<(), String> {
             analyzed.replaced.join(", ")
         ));
     }
-    let shaders = stage(
-        p,
-        "shaders",
-        "discover and translate shaders for macOS",
-        || {
-            // Only a game on NVN has NVN shaders to split and translate
-            if analyzed.graphics != nxtitle::GraphicsApi::Nvn {
-                // a game on Vulkan has its shaders translated after the RomFS is in the run folder
-                return Ok((
-                    vec![],
-                    format!("none: the game renders with {}", analyzed.graphics.id()),
-                ));
-            }
-            let files = auto_shaders::discover(&game.modules, &game.files, false)?;
-            let count = files
-                .iter()
-                .filter(|(n, _)| n.ends_with(".metallib"))
-                .count();
-            Ok((
-                files,
-                format!("{count} Metal libraries (zero does not prove no shaders are needed)"),
-            ))
-        },
-    )?;
-    // Claim the staging folder instead of reusing a folder or following a symlink.
+    let _ = std::fs::remove_dir_all(&partial);
     if let Some(parent) = partial.parent() {
         std::fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
     }
@@ -161,28 +124,110 @@ pub(super) fn run(a: &Args, p: &Say) -> Result<(), String> {
             analyzed.launcher(&game).as_bytes(),
         )?;
         put(&run, "main.npdm", &game.npdm)?;
-        for dir in &game.directories {
-            let rel =
-                nxb_extract::safe_path::rel("run folder", dir, false).map_err(|e| e.to_string())?;
-            std::fs::create_dir_all(run.join(&rel)).map_err(|e| io(&run.join(&rel), e))?;
-        }
-        for (name, bytes) in game.files.iter().chain(&shaders) {
+        for (name, bytes) in &game.files {
             put(&run, name, bytes)?;
+        }
+        if let Some(romfs_dir) = &game.romfs_dir {
+            super::link(
+                p,
+                a.threads,
+                romfs_dir,
+                game.romfs_overlay.as_deref(),
+                &run.join("romfs"),
+                "linking RomFS",
+            )?;
+        } else {
+            std::fs::create_dir_all(run.join("romfs")).map_err(|e| io(&run.join("romfs"), e))?;
+        }
+        for (index, aoc_dir) in &game.aoc_dirs {
+            let rel = format!("aoc/{index}");
+            if aoc_dir.is_dir() {
+                super::link(p, a.threads, aoc_dir, None, &run.join(&rel), "linking DLC")?;
+            } else {
+                std::fs::create_dir_all(run.join(&rel)).map_err(|e| io(&run.join(&rel), e))?;
+            }
         }
         link::module_files(&run, &analyzed.modules, |_, _| {})?;
         link::write_dylib(&run, &analyzed.modules, |_, _| {})?;
         Ok((run, "Mac host and guest linked".into()))
     })?;
-    if vulkan {
-        let scratch =
-            crate::host::TempDir::new_in(a.work_dir.as_deref().unwrap_or(&std::env::temp_dir()))?;
-        stage(p, "shaders", "translate the SPIR-V shaders", || {
-            let d = vk_shaders::run(a, scratch.path(), p, &run)?;
-            Ok(((), d.summary))
-        })?;
-    }
-    stage(p, "bundle", "sign and publish new app", || {
-        bundle::sign(&partial)?;
+    stage(
+        p,
+        "shaders",
+        if vulkan {
+            "translate the SPIR-V shaders"
+        } else {
+            "discover and translate shaders for macOS"
+        },
+        || {
+            if vulkan {
+                let scratch = crate::host::TempDir::new_in(
+                    a.work_dir.as_deref().unwrap_or(&std::env::temp_dir()),
+                )?;
+                let d = vk_shaders::run(a, scratch.path(), p, &run)?;
+                return Ok(((), d.summary));
+            }
+            // Only a game on NVN has NVN shaders to split and translate
+            if analyzed.graphics != nxtitle::GraphicsApi::Nvn {
+                return Ok((
+                    (),
+                    format!("none: the game renders with {}", analyzed.graphics.id()),
+                ));
+            }
+            let romfs_fallback = run.join("romfs");
+            let romfs_dir = game.romfs_dir.as_deref().unwrap_or(&romfs_fallback);
+            let count = auto_shaders::discover_dir(
+                &game.modules,
+                romfs_dir,
+                game.romfs_overlay.as_deref(),
+                false,
+                a.threads,
+                &run,
+            )?;
+            Ok((
+                (),
+                format!("{count} Metal libraries (zero does not prove no shaders are needed)"),
+            ))
+        },
+    )?;
+    stage(p, "bundle", "publish new app", || {
+        let old_save = out.join("Contents/Resources/nxkit/save");
+        if old_save.is_dir() {
+            let new_save = run.join("save");
+            if new_save.exists() {
+                return Err(format!(
+                    "{}: the new app already has a save folder",
+                    new_save.display()
+                ));
+            }
+            std::fs::rename(&old_save, &new_save).map_err(|e| io(&new_save, e))?;
+            p.say(&format!(
+                "save: kept from the old app ({})",
+                new_save.display()
+            ));
+        }
+        match super::fonts::write(&run.join("font")) {
+            Ok(s) => p.say(&s),
+            Err(e) => p.say(&format!(
+                "warning: no shared fonts, button icons draw as \"?\": {e}"
+            )),
+        }
+        let icon_jpg = run.join("icon.jpg");
+        if icon_jpg.is_file() {
+            let icon_scratch = crate::host::TempDir::new_in(
+                a.work_dir.as_deref().unwrap_or(&std::env::temp_dir()),
+            )?;
+            match super::icon::write(
+                &icon_jpg,
+                &partial.join("Contents/Resources"),
+                icon_scratch.path(),
+            ) {
+                Ok(s) => p.say(&s),
+                Err(e) => p.say(&format!("warning: no app icon: {e}")),
+            }
+        } else {
+            p.say("warning: no app icon, the control data has no icon.jpg");
+        }
         publish(&partial, &out)?;
         Ok(((), out.display().to_string()))
     })?;
@@ -200,13 +245,7 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let out = root.join("Game.app");
         let partial = root.join("Game.app.partial");
-        assert!(vacant(&out).is_ok());
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(root.join("missing"), &out).unwrap();
-            assert!(vacant(&out).is_err());
-            std::fs::remove_file(&out).unwrap();
-        }
+        assert!(super::super::replaceable(&out).is_ok());
         std::fs::create_dir(&partial).unwrap();
         put(&partial, "/nested/file", b"data").unwrap();
         assert_eq!(std::fs::read(partial.join("nested/file")).unwrap(), b"data");
@@ -214,9 +253,13 @@ mod tests {
         std::fs::create_dir(&out).unwrap();
         assert!(publish(&partial, &out).is_err());
         assert!(partial.join("nested/file").is_file());
-        std::fs::remove_dir(&out).unwrap();
+        // An existing nxkit app is replaceable and replaced by publish.
+        let host = out.join("Contents/MacOS/nxkit-host");
+        std::fs::create_dir_all(host.parent().unwrap()).unwrap();
+        std::fs::write(&host, b"old-host").unwrap();
         publish(&partial, &out).unwrap();
         assert!(out.join("nested/file").is_file());
+        assert!(!out.join("Contents/MacOS/nxkit-host").exists());
         assert!(!partial.exists());
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -365,7 +365,7 @@ fn slot_commands(
     arena: &mut Arena,
     pools: &mut PoolRefs<Arc<GuestMemory>>,
 ) -> Result<(Vec<IcbCommand>, bool), Skip> {
-    let p = prepare(sh, pc, d, arena, true)?;
+    let p = prepare(sh, pc, d, arena, true, None, false)?;
     let data = |addr: u64| (arena.buffer.clone(), arena.offset_of(addr));
     let mut c = vec![IcbCommand::SetPipeline(p.pipeline.clone())];
     let (b, offset) = data(p.vertex_args);

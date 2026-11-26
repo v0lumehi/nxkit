@@ -65,7 +65,7 @@ pub(super) fn encode(
     args: u64,
     indirect: u64,
 ) -> Result<(), Skip> {
-    let rec = crate::geometry::indirect_args(sh.pools, indirect, 12)?.real;
+    let rec = sh.sh.indirect_real(indirect, 12)?;
     let kernel = sh
         .pipelines
         .host_compute("nxkit-dispatch-size", MSL, "nxkit_dispatch_size")?;

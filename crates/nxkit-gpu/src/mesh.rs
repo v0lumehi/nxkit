@@ -40,12 +40,14 @@ pub(crate) fn splits(count: u32, task: bool) -> u32 {
     }
 }
 
-/// Translates a task and mesh draw.
+/// Translates a task and mesh draw. When `cond_mesh` is true, a direct mesh draw uses the indirect arguments written
+/// by the conditional-render pre-pass.
 pub(crate) fn prepare(
     sh: &Shared<'_>,
     pc: &PassCtx,
     d: &DrawDetail,
     sink: &mut dyn Sink,
+    cond_mesh: bool,
 ) -> Result<Prep, Skip> {
     let cull = cull_of(d)?;
     let key = d.program.mesh.as_deref().ok_or(Skip::Program)?;
@@ -89,22 +91,31 @@ pub(crate) fn prepare(
     let (object_threads, mesh_threads) = (ti.map_or(1, |t| t.threads), mi.threads);
     let geom = match d.args {
         DrawArgs::MeshTasks { first, count } => {
-            let n = splits(count, task).max(1);
-            let mut words = Vec::with_capacity(n as usize * FIRST_STRIDE as usize);
-            for k in 0..n {
-                words.extend(first.wrapping_add(k * MAX_GRID).to_le_bytes());
-                words.extend([0u8; FIRST_STRIDE as usize - 4]);
-            }
-            Geom::Mesh {
-                first: sink.put(&words)?,
-                count,
-                object_threads,
-                mesh_threads,
-                task,
+            if cond_mesh {
+                Geom::MeshIndirect {
+                    splits: splits(count, task).max(1),
+                    object_threads,
+                    mesh_threads,
+                    task,
+                }
+            } else {
+                let n = splits(count, task).max(1);
+                let mut words = Vec::with_capacity(n as usize * FIRST_STRIDE as usize);
+                for k in 0..n {
+                    words.extend(first.wrapping_add(k * MAX_GRID).to_le_bytes());
+                    words.extend([0u8; FIRST_STRIDE as usize - 4]);
+                }
+                Geom::Mesh {
+                    first: sink.put(&words)?,
+                    count,
+                    object_threads,
+                    mesh_threads,
+                    task,
+                }
             }
         }
         DrawArgs::MeshTasksIndirect { indirect } => {
-            crate::geometry::indirect_args(sh.pools, indirect, 8)?;
+            sh.indirect_real(indirect, 8)?;
             Geom::MeshIndirect {
                 splits: if task { 1 } else { INDIRECT_SPLITS },
                 object_threads,

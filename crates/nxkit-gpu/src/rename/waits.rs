@@ -37,7 +37,10 @@ impl State {
                         if n > 0 {
                             c.hits += 1;
                             // A range that shaders only read and the CPU writes while frames run is a snapshot.
-                            if c.ro && c.learn.class() == Class::Watch && c.hits >= SNAPSHOT_HITS {
+                            if c.ro
+                                && matches!(c.learn.class(), Class::Watch | Class::Never)
+                                && c.hits >= SNAPSHOT_HITS
+                            {
                                 c.learn.set(Class::Snapshot);
                                 news.push(*addr);
                             }
@@ -167,6 +170,7 @@ impl State {
     /// and the GPU cannot have written them.
     pub(super) fn before_wait(&mut self, fence: u64, read: &dyn Fn(u64, &mut [u8]) -> bool) {
         let now = self.frame;
+        let period = self.period();
         let mut seen: Vec<(u64, usize)> = Vec::new();
         for (addr, c) in &mut self.cands {
             if let Some(s) = &mut c.sample
@@ -195,7 +199,8 @@ impl State {
                 c.hits += 1;
                 c.quiet = 0;
                 // A range that shaders only read and the CPU writes while frames run is a snapshot.
-                if c.learn.class() == Class::Watch && c.hits >= SNAPSHOT_HITS {
+                if matches!(c.learn.class(), Class::Watch | Class::Never) && c.hits >= SNAPSHOT_HITS
+                {
                     c.learn.set(Class::Snapshot);
                     news.push(addr);
                 }
@@ -204,7 +209,7 @@ impl State {
                 c.rest_until = if c.quiet >= SETTLE_PROBES {
                     now + REPROBE
                 } else {
-                    now
+                    now + period
                 };
             }
             c.sample = None;

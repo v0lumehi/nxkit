@@ -129,7 +129,7 @@ fn nup_external_dlc_requires_matching_family_and_kind() {
 }
 
 #[test]
-fn strict_membership_rejects_fallback_and_ambiguity() {
+fn membership_allows_multiprogram_and_renamed_ncas_but_rejects_wrong_title_and_dlc_ambiguity() {
     use nxb_extract::meta::Cnmt;
     use nxb_extract::nca::ContentType::{Data, Program, PublicData};
     let application = Cnmt {
@@ -138,14 +138,27 @@ fn strict_membership_rejects_fallback_and_ambiguity() {
         version: 2,
         contents: vec!["listed".into()],
     };
-    assert!(checked_metadata(vec![application.clone()], &[("renamed", Program, APP)]).is_err());
+    assert!(checked_metadata(vec![application.clone()], &[("renamed", Program, APP)]).is_ok());
     assert!(checked_metadata(vec![application.clone()], &[("listed", Program, APP + 1)]).is_err());
     assert!(
         checked_metadata(
             vec![application.clone()],
             &[("listed", Program, APP), ("listed", Program, APP)]
         )
-        .is_err()
+        .is_ok()
+    );
+    let multi = Cnmt {
+        kind: 0x80,
+        title: APP,
+        version: 2,
+        contents: vec!["prog0".into(), "prog1".into()],
+    };
+    assert!(
+        checked_metadata(
+            vec![multi],
+            &[("prog0", Program, APP), ("prog1", Program, APP + 1)]
+        )
+        .is_ok()
     );
     assert!(
         checked_metadata(
@@ -176,6 +189,30 @@ fn strict_membership_rejects_fallback_and_ambiguity() {
         .is_err()
     );
     assert!(checked_metadata(vec![dlc.clone()], &[("listed", Data, dlc.title)]).is_ok());
+}
+
+#[test]
+fn switch2_001_application_and_patch_ids_match() {
+    const SW2: u64 = 0x0400_ABCD_0000_0001;
+    assert_eq!(generic_family("Application", SW2), Ok(SW2));
+    assert_eq!(generic_family("Patch", SW2 | 0x800), Ok(SW2));
+    assert!(generic_family("Application", 0x0400_ABCD_0000_0800).is_err());
+    assert!(generic_family("Application", APP + 1).is_err());
+    assert!(generic_family("Patch", APP + 0x801).is_err());
+    let inputs = select_generic(
+        vec![
+            package("base.nsp", GenericRole::Input, &[("Application", SW2, 0)]),
+            package(
+                "update.nsp",
+                GenericRole::Update,
+                &[("Patch", SW2 | 0x800, 65536)],
+            ),
+        ],
+        None,
+    )
+    .unwrap();
+    assert_eq!(inputs.app, SW2);
+    assert_eq!(inputs.updates, vec![(65536, PathBuf::from("update.nsp"))]);
 }
 
 #[test]

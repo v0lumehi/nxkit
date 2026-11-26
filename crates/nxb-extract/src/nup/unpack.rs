@@ -276,7 +276,7 @@ fn make_dirs(root: &Path, dirs: &[String], threads: usize) -> Result<()> {
 fn put(n: &Nup, job: &Job, verify: bool, budget: &Budget) -> Result<(Option<Vec<u8>>, u64)> {
     let f = &n.files[job.file];
     let werr = |e: std::io::Error| ExtractError::io(format!("write {}", job.path.display()), e);
-    if f.zstd || f.size <= WHOLE {
+    if f.size <= WHOLE {
         let held = budget.take(f.size + if f.zstd { f.stored } else { 0 });
         let r = n.read_checked(job.file, verify).and_then(|data| {
             std::fs::write(&job.path, &data).map_err(werr)?;
@@ -287,26 +287,26 @@ fn put(n: &Nup, job: &Job, verify: bool, budget: &Budget) -> Result<(Option<Vec<
         }
         return Ok((Some(r?), held));
     }
-    // a large raw file: in chunks, hashed on the way
+    // a large file: streamed in chunks, hashed on the way
     let mut out = std::fs::File::create(&job.path).map_err(werr)?;
     let held = budget.take(CHUNK as u64);
+    let _give = Give(budget, held);
+    if f.zstd {
+        super::stream::put_zstd_stream_into(n, job.file, &job.path, &job.rel, &mut out, verify)?;
+        return Ok((None, 0));
+    }
     let mut buf = vec![0u8; CHUNK];
     let mut h = verify.then(Sha256::new);
     let mut at = 0u64;
-    let r = (|| {
-        while at < f.size {
-            let k = ((f.size - at) as usize).min(CHUNK);
-            n.st.read_at(f.off + at, &mut buf[..k])?;
-            if let Some(h) = h.as_mut() {
-                h.update(&buf[..k]);
-            }
-            std::io::Write::write_all(&mut out, &buf[..k]).map_err(werr)?;
-            at += k as u64;
+    while at < f.size {
+        let k = ((f.size - at) as usize).min(CHUNK);
+        n.st.read_at(f.off + at, &mut buf[..k])?;
+        if let Some(h) = h.as_mut() {
+            h.update(&buf[..k]);
         }
-        Ok::<(), ExtractError>(())
-    })();
-    budget.give(held);
-    r?;
+        std::io::Write::write_all(&mut out, &buf[..k]).map_err(werr)?;
+        at += k as u64;
+    }
     if let Some(h) = h
         && h.finalize().0 != f.sha
     {
@@ -360,7 +360,8 @@ pub fn unpack_nup(r: &UnpackRequest) -> Result<Unpacked> {
     let app_pkg = n
         .packages
         .iter()
-        .find(|p| p.kind == super::BASE)
+        .find(|p| p.kind == super::BASE && p.title_id == s.app)
+        .or_else(|| n.packages.iter().find(|p| p.kind == super::BASE))
         .unwrap_or(&n.packages[0])
         .clone();
     control(&n, &k, s.base.is_none().then_some(&app_pkg), &r.out)?;
@@ -382,7 +383,7 @@ pub fn unpack_nup(r: &UnpackRequest) -> Result<Unpacked> {
     // no folder of an earlier unpack stays
     remove_tree(&r.aoc, r.threads)?;
     for (tid, pi) in &s.dlc {
-        let index = u32::try_from(tid - s.app - 0x1000).map_err(|_| {
+        let index = u32::try_from(tid - (s.app & !0xFFF) - 0x1000).map_err(|_| {
             bad(
                 &n.path,
                 format!("DLC {tid:016X}: its index does not fit 32 bits"),
@@ -590,3 +591,6 @@ pub fn unpack_nup(r: &UnpackRequest) -> Result<Unpacked> {
         stats,
     })
 }
+
+#[cfg(test)]
+mod tests;

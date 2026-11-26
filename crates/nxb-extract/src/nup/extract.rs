@@ -302,7 +302,8 @@ pub fn extract_nup(r: &NupRequest) -> Result<Vec<ImageResult>> {
     let app_pkg = n
         .packages
         .iter()
-        .find(|p| p.kind == BASE)
+        .find(|p| p.kind == BASE && p.title_id == s.app)
+        .or_else(|| n.packages.iter().find(|p| p.kind == BASE))
         .unwrap_or(&n.packages[0])
         .clone();
     control(
@@ -347,7 +348,7 @@ pub fn extract_nup(r: &NupRequest) -> Result<Vec<ImageResult>> {
     for (tid, pi) in &s.dlc {
         add(
             n.packages[*pi].romfs,
-            aoc.join(format!("{}.img", tid - s.app - 0x1000)),
+            aoc.join(format!("{}.img", tid - (s.app & !0xFFF) - 0x1000)),
         )?;
     }
     let (results, closing) =

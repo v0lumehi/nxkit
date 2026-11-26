@@ -18,6 +18,7 @@ use crate::detail::{DrawDetail, FrameDetail, RecordingRun};
 use crate::fastmap::FastMap;
 use crate::ordinal::Ordinal;
 use crate::pipelines::{Pipelines, Targets};
+use crate::pools::{Backing, Loc, Miss, PoolSnapshot};
 use crate::programs::Programs;
 use crate::skip::Skip;
 use crate::snapshot::EncodeView;
@@ -52,9 +53,25 @@ pub(crate) struct Shared<'a> {
     pub(crate) uploaded: &'a Mutex<FastMap<usize, u64>>,
     /// The snapshots that were uploaded before the chunks started. A lookup needs no lock.
     pub(crate) preloaded: &'a FastMap<usize, u64>,
+    /// Real GPU addresses of CPU-written indirect argument snapshots, keyed by `(guest_addr, bytes)`.
+    pub(crate) indirect_snaps: &'a FastMap<(u64, u32), u64>,
 }
 
 impl Shared<'_> {
+    /// Resolves `bytes` of indirect arguments at guest address `addr`: prefers a renamed copy or an indirect snapshot
+    /// taken at flush time so large CPU-written indirect buffers cannot race, falling back to [`indirect_args`].
+    pub(crate) fn indirect_real(&self, addr: u64, bytes: u64) -> Result<u64, Skip> {
+        if let Ok(len) = u32::try_from(bytes) {
+            if let Some(real) = self.env.rename.resolve(addr, len) {
+                return Ok(real);
+            }
+            if let Some(&real) = self.indirect_snaps.get(&(addr, len)) {
+                return Ok(real);
+            }
+        }
+        indirect_args(self.pools, addr, bytes).map(|l| l.real)
+    }
+
     /// Reads guest memory as the frame sees it: a member page comes from the bytes that the flush staged or from the
     /// mirror, the rest from guest memory. A page that the GPU wrote is stale in guest memory, so a CPU read that feeds the
     /// frame (the indices that are widened, the data that is scanned) goes through here. False when a part is unreadable.
@@ -75,6 +92,47 @@ impl Shared<'_> {
         let off = addr.checked_sub(map.gpu_base())?;
         (off.checked_add(len)? <= map.len()).then_some(off)
     }
+}
+
+/// Why a range did not resolve, for the line of a skip.
+pub(crate) fn pool_miss(miss: Miss) -> String {
+    match miss {
+        Miss::NoPool => "in no pool".into(),
+        Miss::CrossesEdge { pool_end } => format!("crosses the end of its pool at {pool_end:#x}"),
+        Miss::NoBuffer => "its pool has no buffer".into(),
+    }
+}
+
+/// Where `bytes` at `addr` lie when the GPU reads them as words: a 4 byte aligned guest address and real address in
+/// one pool. The error is the reason.
+pub(crate) fn word_loc<B: Backing>(
+    pools: &PoolSnapshot<B>,
+    addr: u64,
+    bytes: u64,
+) -> Result<Loc, String> {
+    if !addr.is_multiple_of(4) {
+        return Err("not 4 byte aligned".into());
+    }
+    let loc = pools
+        .resolve_c(addr, bytes, crate::pools::overlay::STREAM)
+        .map_err(pool_miss)?;
+    if !loc.real.is_multiple_of(4) {
+        return Err(format!("real address {:#x} not 4 byte aligned", loc.real));
+    }
+    Ok(loc)
+}
+
+/// Checks that `bytes` of indirect arguments at `addr` lie in one pool at a 4 byte aligned address.
+pub(crate) fn indirect_args<B: Backing>(
+    pools: &PoolSnapshot<B>,
+    addr: u64,
+    bytes: u64,
+) -> Result<Loc, Skip> {
+    word_loc(pools, addr, bytes).map_err(|w| {
+        crate::buf_skip(format_args!(
+            "indirect arguments addr {addr:#x} bytes {bytes}: {w}"
+        ))
+    })
 }
 
 /// What a render pass looks like to its draws.

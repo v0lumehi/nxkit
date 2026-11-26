@@ -29,8 +29,14 @@ impl State {
             .collect();
         touched.sort_unstable();
         touched.dedup();
+        if !touched.is_empty() && self.probe_cursor != 0 {
+            let split = touched.partition_point(|&a| a < self.probe_cursor);
+            touched.rotate_left(split);
+        }
+        let mut next_cursor: Option<u64> = None;
         let now = self.frame;
-        let learn_frame = now.is_multiple_of(self.period());
+        let period = self.period();
+        let learn_frame = now.is_multiple_of(period);
         // A sample is judged at the flush right after its frame or never: its `post` and `pre_next` must be neighbours.
         for c in self.cands.values_mut() {
             if c.sample.as_ref().is_some_and(|s| s.frame + 1 != now) {
@@ -106,15 +112,19 @@ impl State {
             }
             // A range whose frames are judged for CPU writes in flight only: the Watch class and, to list the conflicts,
             // `Never` and `Idle` with `NXKIT_DIAG=rename`. The bytes that all of them read in a flush are limited.
-            let in_flight = learn_frame
+            let in_flight_cand = learn_frame
                 && now >= c.rest_until
                 && (matches!(class, Class::Watch | Class::Never | Class::Merge)
                     || (self.watch && class == Class::Idle))
-                && (c.ro || probeable(addr, c.size) || class == Class::Idle)
-                && u64::from(c.size) <= budget;
+                && (c.ro || probeable(addr, c.size) || class == Class::Idle);
+            let in_flight = in_flight_cand && u64::from(c.size) <= budget;
+            if in_flight_cand && !in_flight {
+                next_cursor.get_or_insert(addr);
+            }
             let learn_judge = matches!(class, Class::Learning | Class::Rename);
+            let ro_judge = c.ro && c.sample.is_some();
             // Only a range that is judged in this flush is read. Most bound ranges are not.
-            let want = (c.sample.is_some() && learn_judge)
+            let want = (c.sample.is_some() && (learn_judge || ro_judge))
                 || (learn_frame && c.learn.sampling())
                 || in_flight;
             let mut pre = if want {
@@ -123,16 +133,58 @@ impl State {
                 Vec::new()
             };
             let have = want && read(addr, &mut pre);
-            if have {
+            if have && !learn_judge && in_flight {
                 budget = budget.saturating_sub(u64::from(c.size));
             }
-            if let Some(prev) = c.sample.take()
-                && learn_judge
-                && let Some(post) = prev.post
-                && have
-                && let Some(class) = c.learn.observe(judge(&prev.pre, &post, &pre))
-            {
-                out.news.push((addr, c.size, class, c.learn.frames()));
+            if let Some(prev) = c.sample.take() {
+                if learn_judge
+                    && let Some(post) = prev.post
+                    && have
+                    && let Some(class) = c.learn.observe(judge(&prev.pre, &post, &pre))
+                {
+                    out.news.push((addr, c.size, class, c.learn.frames()));
+                } else if !learn_judge && c.ro && have {
+                    let n: usize = cpu_mask(&prev.pre, &pre)
+                        .iter()
+                        .map(|w| w.count_ones() as usize)
+                        .sum();
+                    let not_gpu = n == 0
+                        || !copy_dsts
+                            .get_or_insert_with(written)
+                            .iter()
+                            .any(|&d| overlaps((addr, addr + u64::from(c.size)), d));
+                    if n > 0 && not_gpu {
+                        c.hits += 1;
+                        c.quiet = 0;
+                        if matches!(c.learn.class(), Class::Watch | Class::Never)
+                            && c.hits >= SNAPSHOT_HITS
+                        {
+                            c.learn.set(Class::Snapshot);
+                            out.news
+                                .push((addr, c.size, Class::Snapshot, c.learn.frames()));
+                        }
+                    } else if n == 0 {
+                        c.quiet += 1;
+                        c.rest_until = if c.quiet >= SETTLE_PROBES {
+                            now + REPROBE
+                        } else {
+                            now + period
+                        };
+                    }
+                    let e = self.inflight.entry(addr).or_default();
+                    e.size = c.size;
+                    e.class = c.learn.class().name();
+                    e.ro = true;
+                    e.frames += 1;
+                    if n > 0 && not_gpu {
+                        e.hit += 1;
+                        e.words = e.words.max(n);
+                    }
+                }
+            }
+            if c.learn.class() == Class::Snapshot {
+                renaming.push((addr, c.size, Kind::Snapshot));
+                continue;
             }
             let judged_now = learn_frame && c.learn.sampling();
             if c.learn.class() == Class::Rename && !judged_now {
@@ -160,6 +212,9 @@ impl State {
                     out.checking |= c.learn.class() == Class::Rename;
                 }
             }
+        }
+        if learn_frame {
+            self.probe_cursor = next_cursor.unwrap_or(0);
         }
         if !out.news.is_empty() {
             self.last_event = now;

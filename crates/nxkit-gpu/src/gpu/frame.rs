@@ -147,7 +147,8 @@ impl Gpu {
         crate::private::note_learned(self.gmem.learned());
         // The storage ranges that this frame reads from a copy of its own (the overlap, `rename`). The slot's earlier
         // frame is written back first.
-        let (rename_map, rename_buf, merges) = self.rename_begin(detail, pools, region);
+        let (rename_map, rename_buf, merges, indirect_snaps) =
+            self.rename_begin(detail, pools, region);
         let merge_table = if merges.is_empty() {
             None
         } else {
@@ -410,6 +411,7 @@ impl Gpu {
             scale,
             uploaded: &uploaded,
             preloaded: &preloaded,
+            indirect_snaps: &indirect_snaps,
         };
         let tupscale = self.tupscale.as_ref().and_then(|t| t.prepare(&shared));
         let sh = crate::encode::EncodeCtx {

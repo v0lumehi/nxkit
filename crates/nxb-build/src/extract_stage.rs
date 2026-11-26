@@ -20,14 +20,20 @@ fn split_outputs(b: &Build) -> nxb_extract::split::SplitOutputs {
     }
 }
 
+fn show_allow_damaged_hint(files: &[String]) -> bool {
+    !files.iter().all(|f| f.contains("IVFC hash level"))
+}
+
 pub(crate) fn damaged(p: &Progress, e: &nxb_extract::ExtractError) -> String {
     if let nxb_extract::ExtractError::Damaged(files) = e {
         for f in files.iter().take(20) {
             p.say(&format!("nxb: error: hash check failed: {f}"));
         }
-        p.say(
-            "nxb: error: the package is damaged (--allow-damaged writes the files as read and goes on)",
-        );
+        if show_allow_damaged_hint(files) {
+            p.say(
+                "nxb: error: the package is damaged (--allow-damaged writes the files as read and goes on)",
+            );
+        }
     }
     crate::exit::fail(e.exit_code(), e.to_string())
 }
@@ -246,4 +252,22 @@ pub(crate) fn nup_loose(
         }
     );
     Ok((text, u.split_unsupported))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::show_allow_damaged_hint;
+
+    #[test]
+    fn allow_damaged_hint_is_suppressed_for_ivfc_only_errors() {
+        assert!(!show_allow_damaged_hint(&[
+            "nca1: IVFC hash level 0 mismatch".into(),
+            "nca2: IVFC hash level 2 mismatch".into(),
+        ]));
+        assert!(show_allow_damaged_hint(&[
+            "nca1: IVFC hash level 0 mismatch".into(),
+            "nca2: section hash mismatch".into(),
+        ]));
+        assert!(show_allow_damaged_hint(&["nca1: bad hash".into()]));
+    }
 }

@@ -21,6 +21,8 @@ pub(crate) fn prepare(
     d: &DrawDetail,
     sink: &mut dyn Sink,
     icb: bool,
+    cond_indirect: Option<u64>,
+    cond_mesh: bool,
 ) -> Result<Prep, Skip> {
     // The vertices come from a transform feedback capture the host does not run (`walk::feedback`).
     if d.feedback_input {
@@ -31,7 +33,7 @@ pub(crate) fn prepare(
         return Err(Skip::Encode);
     }
     if d.args.is_mesh() {
-        return crate::mesh::prepare(sh, pc, d, sink);
+        return crate::mesh::prepare(sh, pc, d, sink, cond_mesh);
     }
     let cull = cull_of(d)?;
     let (primitive, _) = translate::primitive(d.topology).ok_or(Skip::Primitive)?;
@@ -49,7 +51,7 @@ pub(crate) fn prepare(
         .pipelines
         .render(d, &vs, fs.as_deref(), &pc.targets, icb)?;
     let f = fixed(sh, pc, d, cull)?;
-    let (geom, base_instance) = crate::geometry::geometry(sh, d, primitive, sink)?;
+    let (geom, base_instance) = crate::geometry::geometry(sh, d, primitive, sink, cond_indirect)?;
     let mut streams = Vec::with_capacity(d.streams.len());
     let mut stream_locs = Vec::with_capacity(d.streams.len());
     for s in &d.streams {

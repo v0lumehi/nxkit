@@ -14,9 +14,10 @@ type GenericPackage = (PathBuf, GenericRole, Metas);
 
 fn generic_family(kind: &str, title: u64) -> Result<u64, String> {
     let low = title & 0xFFF;
+    let sw2 = (title >> 56) == 0x04;
     match kind {
-        "Application" if low == 0 => Ok(title),
-        "Patch" if low == 0x800 => Ok(title - 0x800),
+        "Application" if low == 0 || (sw2 && low < 0x800) => Ok(title),
+        "Patch" if low == 0x800 || (sw2 && (low & 0xF00) == 0x800) => Ok(title - 0x800),
         "AddOnContent" if (1..=2000).contains(&low) => (title & !0xFFF)
             .checked_sub(0x1000)
             .ok_or_else(|| format!("invalid DLC title ID {title:016X}")),
@@ -63,13 +64,21 @@ fn checked_metadata(
                 ));
             }
         } else {
-            let programs: Vec<_> = ncas
+            let mut programs: Vec<_> = ncas
                 .iter()
-                .filter(|(id, ty, _)| *ty == ContentType::Program && listed(id))
+                .filter(|(id, ty, title)| {
+                    *ty == ContentType::Program && *title == app && listed(id)
+                })
                 .collect();
-            if programs.len() != 1 || programs[0].2 != app {
+            if programs.is_empty() {
+                programs = ncas
+                    .iter()
+                    .filter(|(_, ty, title)| *ty == ContentType::Program && *title == app)
+                    .collect();
+            }
+            if programs.is_empty() {
                 return Err(format!(
-                    "{kind} {:016X} needs exactly one listed Program NCA of application {app:016X}; missing, renamed or multi-program content is unsupported",
+                    "{kind} {:016X} has no Program NCA of application {app:016X}",
                     meta.title
                 ));
             }

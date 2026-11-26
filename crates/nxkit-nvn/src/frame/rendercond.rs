@@ -210,6 +210,8 @@ pub struct RenderConds {
     diag: probe::Probe,
     /// The condition that each queue carries into its next submit, for the gate lines.
     gates: gate::Gates,
+    /// Same-frame GPU conditional rendering condition active on each queue.
+    gpu_conds: HashMap<usize, crate::frame::GpuCond>,
     /// The first evaluations, for `NXKIT_DIAG=rendercond`.
     pub evaluations: Vec<Evaluation>,
 }
@@ -230,27 +232,50 @@ impl RenderConds {
         frame: &mut Frame,
         read: impl Fn(u64) -> Option<u64>,
     ) {
+        self.apply_with(queue, base, marks, frame, read, force::force());
+    }
+
+    /// [`RenderConds::apply`] with explicit `force` bits (thread-safe for unit tests).
+    pub(crate) fn apply_with(
+        &mut self,
+        queue: usize,
+        base: u32,
+        marks: &[Mark],
+        frame: &mut Frame,
+        read: impl Fn(u64) -> Option<u64>,
+        bits: u8,
+    ) {
         let mut on = !self.off.get(&queue).copied().unwrap_or(false);
         self.counters.begin(queue, base);
         let rec = gate::enabled();
         let mut cond = if rec { self.gates.get(queue) } else { None };
         let mut cover_from = base;
-        if marks.is_empty() && on && cond.is_none() {
+        let mut gpu_cond = self.gpu_conds.get(&queue).copied();
+        let mut gpu_from = base;
+        if marks.is_empty() && on && cond.is_none() && gpu_cond.is_none() {
             self.counters.end(queue, frame.cmds.len() as u32, frame);
             return;
         }
         let mut from = base;
         for m in marks {
             let at = base + m.at;
-            let (next, info) = match m.op {
+            let (next, info, next_gpu) = match m.op {
                 MarkOp::RenderEnable(v) => {
                     self.stats.enables += 1;
                     self.stats.disables += u32::from(!v);
-                    (v, None)
+                    (v, None, None)
                 }
                 MarkOp::RenderIf { mode, addr } => {
-                    let i = self.evaluate(mode, addr, &read);
-                    (i.decision.render, Some(i))
+                    let i = self.evaluate_with(mode, addr, &read, bits);
+                    let gc = if i.decision.render
+                        && i.decision.forced == 0
+                        && i.source == force::Source::Unknown
+                    {
+                        self.resolve_gpu_cond(mode, addr, frame, &read)
+                    } else {
+                        None
+                    };
+                    (i.decision.render, Some(i), gc)
                 }
                 MarkOp::ReportValue { addr, value } => {
                     self.stats.values += 1;
@@ -272,21 +297,74 @@ impl RenderConds {
             if !on {
                 frame.disable(from..at);
             }
+            if let Some(gc) = gpu_cond {
+                frame.push_gpu_cond(gpu_from..at, gc);
+            }
             if rec {
                 Self::cover(frame, cover_from..at, cond);
                 (cond, cover_from) = (info, at);
             }
             (on, from) = (next, at);
+            (gpu_cond, gpu_from) = (next_gpu, at);
         }
+        let end = frame.cmds.len() as u32;
         if !on {
-            frame.disable(from..frame.cmds.len() as u32);
+            frame.disable(from..end);
+        }
+        if let Some(gc) = gpu_cond {
+            frame.push_gpu_cond(gpu_from..end, gc);
+            self.gpu_conds.insert(queue, gc);
+        } else {
+            self.gpu_conds.remove(&queue);
         }
         if rec {
-            Self::cover(frame, cover_from..frame.cmds.len() as u32, cond);
+            Self::cover(frame, cover_from..end, cond);
             self.gates.set(queue, cond);
         }
         self.off.insert(queue, !on);
-        self.counters.end(queue, frame.cmds.len() as u32, frame);
+        self.counters.end(queue, end, frame);
+    }
+
+    /// Resolves a render condition into same-frame GPU visibility operands when at least one side references a
+    /// `SamplesPassed` report emitted in `frame` and the other side is a constant or same-frame report.
+    fn resolve_gpu_cond(
+        &self,
+        mode: u32,
+        addr: u64,
+        frame: &Frame,
+        read: &impl Fn(u64) -> Option<u64>,
+    ) -> Option<crate::frame::GpuCond> {
+        use crate::frame::{CondOperand, GpuCond};
+        if mode != RENDER_IF_EQUAL && mode != RENDER_IF_NOT_EQUAL {
+            return None;
+        }
+        let operand = |a: u64| -> Option<CondOperand> {
+            match self.reports.get(&a) {
+                Some(Report::Gpu { seq, .. }) => {
+                    let idx = frame
+                        .counters
+                        .writes
+                        .binary_search_by_key(seq, |w| w.seq)
+                        .ok()?;
+                    (crate::counters::source(frame.counters.writes[idx].kind) == Source::Samples)
+                        .then_some(CondOperand::SameFrameWrite(idx as u32))
+                }
+                Some(Report::Known { value, flush }) if self.flush - flush < KEEP_FLUSHES => {
+                    Some(CondOperand::Const(*value))
+                }
+                Some(Report::Unknown | Report::Known { .. }) => None,
+                None => read(a).map(CondOperand::Const),
+            }
+        };
+        let a = operand(addr)?;
+        let b = operand(addr.wrapping_add(16))?;
+        if matches!(a, CondOperand::SameFrameWrite(_))
+            || matches!(b, CondOperand::SameFrameWrite(_))
+        {
+            Some(GpuCond { mode, a, b })
+        } else {
+            None
+        }
     }
 
     /// `ReportCounter` of `kind` at `addr` before command `at`.
@@ -336,12 +414,7 @@ impl RenderConds {
         self.report(addr, r);
     }
 
-    /// Decides the condition. An unknown counter or mode renders, unless a switch of [`force`] says otherwise.
-    fn evaluate(&mut self, mode: u32, addr: u64, read: &impl Fn(u64) -> Option<u64>) -> gate::Info {
-        self.evaluate_with(mode, addr, read, force::force())
-    }
-
-    /// [`RenderConds::evaluate`] with the switches `bits`, so that a test does not depend on the global ones.
+    /// [`RenderConds::evaluate_with`] with the switches `bits`, so that a test does not depend on the global ones.
     fn evaluate_with(
         &mut self,
         mode: u32,
@@ -439,12 +512,14 @@ impl RenderConds {
         self.flush += 1;
         self.counters.flushed();
         self.diag.flushed();
+        self.gpu_conds.clear();
     }
 
     /// Forgets the condition and the counter slots of a queue (`nvnQueueFinalize`).
     pub fn drop_queue(&mut self, queue: usize) {
         self.off.remove(&queue);
         self.counters.drop_queue(queue);
+        self.gpu_conds.remove(&queue);
     }
 
     /// The counters since the last call.
@@ -453,109 +528,9 @@ impl RenderConds {
     }
 }
 
-/// The commands of `frame` that a false condition leaves out, by kind: draws, clears, dispatches, copies.
-pub fn disabled_counts(frame: &Frame) -> [u32; 4] {
-    let mut n = [0u32; 4];
-    for r in &frame.disabled {
-        for i in r.clone() {
-            if !frame.skips(i) {
-                continue;
-            }
-            let k = match frame.cmds.get(i as usize) {
-                Some(Cmd::Draw { .. }) => 0,
-                Some(Cmd::ClearColor { .. } | Cmd::ClearDepthStencil { .. }) => 1,
-                Some(Cmd::Dispatch { .. }) => 2,
-                _ => 3,
-            };
-            n[k] += 1;
-        }
-    }
-    n
-}
-
-/// The little-endian word at a GPU address, None outside guest memory.
-pub(crate) fn read_gpu_u64<S: GpuSpace, M: GuestMem>(space: &S, mem: &M, addr: u64) -> Option<u64> {
-    let host = space.host_address(GpuAddr::new(addr).ok()?, 8).ok()?;
-    let mut b = [0u8; 8];
-    mem.read(host, &mut b).ok()?;
-    Some(u64::from_le_bytes(b))
-}
-
-/// `NXKIT_DIAG=rendercond`: one line for a frame that set a condition or left something out (the first 300 such
-/// frames, then every 60th), and the first evaluations with the counters they read. The backend adds a line for the
-/// emulated counters it wrote (`nxkit-gpu`, `queries`).
-pub(crate) fn frame_diag(rc: &mut RenderConds, frame: &Frame) {
-    static ON: nxkit_abi::live::Memo = nxkit_abi::live::Memo::new();
-    if !ON.flag(|| crate::diag::on("rendercond")) {
-        return;
-    }
-    static FRAMES: AtomicU32 = AtomicU32::new(0);
-    static LINES: AtomicU32 = AtomicU32::new(0);
-    let s = rc.take_stats();
-    let n = FRAMES.fetch_add(1, Ordering::Relaxed);
-    for (mode, addr, a, b, r) in rc.evaluations.drain(..) {
-        if crate::diag::first(&LINES, 200) {
-            eprintln!(
-                "DIAG rendercond frame {n}: if {} at {addr:#x}: counters {a:x?} and {b:x?} -> {}",
-                if mode == RENDER_IF_EQUAL {
-                    "equal"
-                } else if mode == RENDER_IF_NOT_EQUAL {
-                    "not equal"
-                } else {
-                    "unknown mode"
-                },
-                r.map_or("unknown, renders", |r| if r {
-                    "renders"
-                } else {
-                    "left out"
-                })
-            );
-        }
-    }
-    rc.evaluations.shrink_to(64);
-    if s.is_empty() && frame.disabled.is_empty() {
-        return;
-    }
-    static SHOWN: AtomicU32 = AtomicU32::new(0);
-    let shown = SHOWN.fetch_add(1, Ordering::Relaxed);
-    if shown < 300 || shown.is_multiple_of(60) {
-        let [d, c, x, k] = disabled_counts(frame);
-        let kinds: Vec<String> = s
-            .kinds
-            .iter()
-            .enumerate()
-            .filter(|(_, n)| **n > 0)
-            .map(|(k, n)| format!("{k:#x}:{n}"))
-            .collect();
-        let forced = if s.forced == [0; 3] {
-            String::new()
-        } else {
-            format!(
-                " | forced decisions rcflag {} rcunk {} rcall {}",
-                s.forced[0], s.forced[1], s.forced[2]
-            )
-        };
-        eprintln!(
-            "DIAG rendercond frame {n}: enable {} (off {}), conditions true {} false {} unknown {} (read landed {} stale {} by place {}), reports value {} emulated {} (zero {}) gpu-only {} by type [{}] in {} slots | left out: draws {d} clears {c} dispatches {x} copies {k} in {} ranges of {} commands{forced}",
-            s.enables,
-            s.disables,
-            s.true_,
-            s.false_,
-            s.unknown,
-            s.landed,
-            s.stale,
-            s.placed,
-            s.values,
-            s.emulated,
-            s.zero,
-            s.counters,
-            kinds.join(" "),
-            frame.counters.slots,
-            frame.disabled.len(),
-            frame.cmds.len()
-        );
-    }
-}
+mod diag;
+pub use diag::disabled_counts;
+pub(crate) use diag::{frame_diag, read_gpu_u64};
 
 pub mod force;
 pub mod gate;

@@ -10,24 +10,31 @@ type Written = (
     FastMap<TexId, (Dirty, usize)>,
 );
 
+/// What `Gpu::rename_begin` prepares for a frame: rename map, slot buffer, merge runs and indirect snapshots.
+type RenameSlot = (
+    crate::rename::RenameMap,
+    Option<Arc<DataBuffer>>,
+    Vec<crate::rename::MergeRun>,
+    FastMap<(u64, u32), u64>,
+);
+
 impl Gpu {
     /// The storage ranges that the frame reads from a copy of its own (the overlap, `rename`): the map where
-    /// the bindings read, the buffer of the slot and the merge ranges.
+    /// the bindings read, the buffer of the slot, the merge ranges and CPU-written indirect-arg snapshots.
     pub(super) fn rename_begin(
         &self,
         detail: &FrameDetail,
         pools: &Arc<GuestPools>,
         region: usize,
-    ) -> (
-        crate::rename::RenameMap,
-        Option<Arc<DataBuffer>>,
-        Vec<crate::rename::MergeRun>,
-    ) {
+    ) -> RenameSlot {
         if crate::overlap::on(self.game_overlap) {
-            self.rename.note_rw(detail, &self.programs);
-            let b = self
-                .rename
-                .begin_slot(region, detail.rename.as_ref(), self.gmem.learned());
+            let gpu_writes = self.rename.note_rw_writes(detail, &self.programs);
+            let b = self.rename.begin_slot(
+                region,
+                detail.rename.as_ref(),
+                self.gmem.learned(),
+                &gpu_writes,
+            );
             // The merge ranges: where the guest range really is. The copy of each is filled and merged back on the GPU.
             let runs: Vec<crate::rename::MergeRun> = b
                 .merges
@@ -43,9 +50,14 @@ impl Gpu {
                     })
                 })
                 .collect();
-            (b.map, b.buf, runs)
+            (b.map, b.buf, runs, b.indirect_snaps)
         } else {
-            (crate::rename::RenameMap::new(), None, Vec::new())
+            (
+                crate::rename::RenameMap::new(),
+                None,
+                Vec::new(),
+                FastMap::default(),
+            )
         }
     }
 

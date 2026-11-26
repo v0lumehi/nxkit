@@ -117,6 +117,8 @@ const KNOBS: &[&str] = &[
     "rcflag",
     // A render condition with an unknown result is left out instead of rendered.
     "rcunk",
+    // Same-frame GPU conditional rendering (`nxkit_cond_draw`) is disabled; unknown conditions render unconditionally.
+    "rcnogpu",
     // Every `SetRenderEnableConditional` renders. `SetRenderEnable` is not changed.
     "rcall",
     // The same as `NXKIT_RENDERCOND_STALE=0`, switched while the game runs: no counter of an earlier report is read.
@@ -185,39 +187,55 @@ const KNOBS: &[&str] = &[
 pub(crate) fn knob(name: &str) -> bool {
     let bit = knob_bit(name);
     debug_assert!(bit != 0, "unknown knob {name}");
-    knobs().flags.load(Ordering::Relaxed) & bit != 0
+    load_flags(&knobs().flags) & bit != 0
 }
 
 /// The names of the knobs that are on now.
 pub(crate) fn knobs_on() -> Vec<&'static str> {
-    let flags = knobs().flags.load(Ordering::Relaxed);
+    let flags = load_flags(&knobs().flags);
     KNOBS
         .iter()
         .enumerate()
-        .filter(|(i, _)| flags & (1 << i) != 0)
+        .filter(|(i, _)| flags & (1u128 << i) != 0)
         .map(|(_, k)| *k)
         .collect()
 }
 
 struct Knobs {
-    flags: AtomicU64,
+    flags: [AtomicU64; 2],
     file: Option<PathBuf>,
     /// The live generation of the last read of `NXKIT_KNOB`.
     seen: AtomicU64,
 }
 
+fn load_flags(flags: &[AtomicU64; 2]) -> u128 {
+    u128::from(flags[0].load(Ordering::Relaxed))
+        | (u128::from(flags[1].load(Ordering::Relaxed)) << 64)
+}
+
+fn store_flags(dst: &[AtomicU64; 2], flags: u128) {
+    dst[0].store(flags as u64, Ordering::Relaxed);
+    dst[1].store((flags >> 64) as u64, Ordering::Relaxed);
+}
+
 fn knobs() -> &'static Knobs {
     static K: OnceLock<Knobs> = OnceLock::new();
-    K.get_or_init(|| Knobs {
-        flags: AtomicU64::new(set_pass_options(parse_knobs(&crate::settings::live().knob))),
-        file: crate::settings::env().knob_file.clone(),
-        seen: AtomicU64::new(nxkit_abi::live::generation()),
+    K.get_or_init(|| {
+        let flags = set_pass_options(parse_knobs(&crate::settings::live().knob));
+        Knobs {
+            flags: [
+                AtomicU64::new(flags as u64),
+                AtomicU64::new((flags >> 64) as u64),
+            ],
+            file: crate::settings::env().knob_file.clone(),
+            seen: AtomicU64::new(nxkit_abi::live::generation()),
+        }
     })
 }
 
 /// Hands the knobs that `nxkit-nvn` acts on to it: the two of the pass optimiser, which makes the plan, and the five
 /// of the render conditions, which it decides on the guest thread. Returns `flags`.
-fn set_pass_options(flags: u64) -> u64 {
+fn set_pass_options(flags: u128) -> u128 {
     use nxkit_nvn::rendercond::force;
     nxkit_nvn::passes::set_options(
         flags & knob_bit("nopassmerge") == 0,
@@ -234,14 +252,17 @@ fn set_pass_options(flags: u64) -> u64 {
     flags
 }
 
-fn knob_bit(name: &str) -> u64 {
-    KNOBS.iter().position(|k| *k == name).map_or(0, |i| 1 << i)
+fn knob_bit(name: &str) -> u128 {
+    KNOBS
+        .iter()
+        .position(|k| *k == name)
+        .map_or(0, |i| 1u128 << i)
 }
 
-fn parse_knobs(list: &str) -> u64 {
+fn parse_knobs(list: &str) -> u128 {
     list.split(',')
         .map(|s| knob_bit(s.trim()))
-        .fold(0, |a, b| a | b)
+        .fold(0u128, |a, b| a | b)
 }
 
 /// The pass range `[lo, hi)` of the `nobar` file.
@@ -274,14 +295,13 @@ pub(crate) fn refresh_knobs() {
         .as_ref()
         .and_then(|f| std::fs::read_to_string(f).ok())
     {
-        k.flags
-            .store(set_pass_options(parse_knobs(&value)), Ordering::Relaxed);
+        store_flags(&k.flags, set_pass_options(parse_knobs(&value)));
         return;
     }
     let now = nxkit_abi::live::generation();
     if k.seen.swap(now, Ordering::Relaxed) != now {
         let flags = set_pass_options(parse_knobs(&crate::settings::live().knob));
-        k.flags.store(flags, Ordering::Relaxed);
+        store_flags(&k.flags, flags);
     }
 }
 
@@ -520,9 +540,9 @@ mod tests {
 
     #[test]
     fn every_knob_has_its_own_bit() {
-        assert!(KNOBS.len() <= 64);
+        assert!(KNOBS.len() <= 128);
         for (i, k) in KNOBS.iter().enumerate() {
-            assert_eq!(knob_bit(k), 1 << i);
+            assert_eq!(knob_bit(k), 1u128 << i);
         }
         assert_eq!(knob_bit("unknown"), 0);
         assert_eq!(

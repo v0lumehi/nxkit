@@ -261,3 +261,225 @@ fn the_masks_of_the_cpu_and_the_gpu_are_found_from_the_three_copies() {
     assert!(!union_mask(&mut m, &[0b100]));
     assert!(is_empty_mask(&[0, 0]) && !is_empty_mask(&[0, 2]));
 }
+
+#[test]
+fn reprobe_exceeds_slow_period() {
+    const {
+        assert!(REPROBE > SLOW_PERIOD);
+    }
+}
+
+#[test]
+fn probe_cursor_rotates_touched_when_watch_budget_is_exceeded() {
+    let mut st = State {
+        fast_only: true,
+        ..State::default()
+    };
+    let half = (WATCH_BUDGET / 2) as u32;
+    let addrs = [0x1000_0000u64, 0x2000_0000, 0x3000_0000];
+    for a in addrs {
+        st.watch_read_only(a, half);
+    }
+    let bound: Vec<(u64, u32)> = addrs.iter().map(|&a| (a, half)).collect();
+    let read = |_: u64, b: &mut [u8]| {
+        b.fill(0);
+        true
+    };
+    run_to_bound(&mut st, &bound, LEARN_PERIOD - 1, &read);
+    for a in addrs {
+        let c = st.cands.get_mut(&a).unwrap();
+        c.sample = None;
+        c.rest_until = 0;
+    }
+    st.flush(
+        LEARN_PERIOD,
+        &bound,
+        &|r| vec![false; r.len()],
+        &|| Vec::new(),
+        &read,
+    );
+    assert!(st.cands[&addrs[0]].sample.is_some());
+    assert!(st.cands[&addrs[1]].sample.is_some());
+    assert!(st.cands[&addrs[2]].sample.is_none());
+    assert_eq!(st.probe_cursor, addrs[2]);
+    run_to_bound(&mut st, &bound, 2 * LEARN_PERIOD - 1, &read);
+    for a in addrs {
+        let c = st.cands.get_mut(&a).unwrap();
+        c.sample = None;
+        c.rest_until = 0;
+    }
+    st.flush(
+        2 * LEARN_PERIOD,
+        &bound,
+        &|r| vec![false; r.len()],
+        &|| Vec::new(),
+        &read,
+    );
+    assert!(st.cands[&addrs[2]].sample.is_some());
+}
+
+fn run_to_bound(
+    st: &mut State,
+    bound: &[(u64, u32)],
+    last: u64,
+    read: &dyn Fn(u64, &mut [u8]) -> bool,
+) {
+    for fence in st.frame + 1..=last {
+        st.flush(
+            fence,
+            bound,
+            &|r| vec![false; r.len()],
+            &|| Vec::new(),
+            read,
+        );
+    }
+}
+
+#[test]
+fn task_and_mesh_sbuf_bindings_are_adopted_and_rw_tracked() {
+    use crate::detail::{DrawArgs, Stage, UboDetail};
+    let Ok(ctx) = nxkit_metal::Context::system_default() else {
+        return;
+    };
+    let mem = Arc::new(nxkit_metal::GuestMemory::allocate(&ctx, 1 << 22).unwrap());
+    let guest = nxkit_metal::GuestSpace::over(&mem).unwrap();
+    let base = guest.address_map().gpu_base();
+    let renamer = Renamer::new(&ctx, guest);
+    let mut detail = FrameDetail::default();
+    let mut draw = crate::walk::empty_draw();
+    draw.program.task = Some(Arc::from("task_prog"));
+    draw.program.mesh = Some(Arc::from("mesh_prog"));
+    draw.args = DrawArgs::MeshTasksIndirect {
+        indirect: base + 0x1000,
+    };
+    draw.sbufs.push(UboDetail {
+        stage: Stage::Task,
+        slot: 0,
+        address: base + 0x2000,
+        size: 0x100,
+        snapshot: None,
+    });
+    draw.sbufs.push(UboDetail {
+        stage: Stage::Mesh,
+        slot: 1,
+        address: base + 0x4000,
+        size: 0x100,
+        snapshot: None,
+    });
+    detail.draws.push(Arc::new(draw));
+    renamer.note_rw_with(&detail, None, &|key, vertex, slot| {
+        assert!(!vertex);
+        matches!((key, slot), ("mesh_prog", 1))
+    });
+    let mut st = lock(&renamer.state);
+    assert_eq!(st.cands[&(base + 0x2000)].learn.class(), Class::Watch);
+    assert_eq!(st.cands[&(base + 0x4000)].learn.class(), Class::Learning);
+    let (bindings, bound) = st.bindings(&detail);
+    assert_eq!(bindings.len(), 2);
+    assert!(bound.contains(&(base + 0x2000, 0x100)));
+    assert!(bound.contains(&(base + 0x4000, 0x100)));
+}
+
+#[test]
+fn collect_indirects_captures_cpu_records_and_begin_slot_filters_gpu_writes() {
+    use crate::detail::{DrawArgs, Stage, UboDetail};
+    let Ok(ctx) = nxkit_metal::Context::system_default() else {
+        return;
+    };
+    let mem = Arc::new(nxkit_metal::GuestMemory::allocate(&ctx, 1 << 24).unwrap());
+    let guest = nxkit_metal::GuestSpace::over(&mem).unwrap();
+    let base = guest.address_map().gpu_base();
+    let renamer = Renamer::new(&ctx, guest.clone());
+    let cpu_ind = base + 0x80_0000;
+    let gpu_ind = base + 0x90_0000;
+    guest
+        .write(cpu_ind - base, &[42, 0, 0, 0, 7, 0, 0, 0])
+        .unwrap();
+    guest
+        .write(gpu_ind - base, &[9, 0, 0, 0, 1, 0, 0, 0])
+        .unwrap();
+    let mut detail = FrameDetail::default();
+    for ind in [cpu_ind, gpu_ind] {
+        let mut draw = crate::walk::empty_draw();
+        draw.program.mesh = Some(Arc::from("mesh_ind"));
+        draw.args = DrawArgs::MeshTasksIndirect { indirect: ind };
+        draw.sbufs.push(UboDetail {
+            stage: Stage::Mesh,
+            slot: 0,
+            address: ind,
+            size: 8,
+            snapshot: None,
+        });
+        detail.draws.push(Arc::new(draw));
+    }
+    let (cap, _) = renamer.at_flush(&detail, 1);
+    let cap = Arc::new(cap.expect("indirects must capture even when cands is empty"));
+    assert_eq!(cap.indirects.len(), 2);
+    // Simulate guest CPU overwriting the record immediately after flush returns.
+    guest.write(cpu_ind - base, &[0; 8]).unwrap();
+    let slotted = renamer.begin_slot(0, Some(&cap), &[], &[(gpu_ind, gpu_ind + 8)]);
+    assert!(slotted.indirect_snaps.contains_key(&(cpu_ind, 8)));
+    assert!(!slotted.indirect_snaps.contains_key(&(gpu_ind, 8)));
+    let snap_addr = slotted.indirect_snaps[&(cpu_ind, 8)];
+    let buf = slotted.buf.expect("slot buf");
+    let off = snap_addr - buf.gpu_address();
+    let mut got = [0u8; 8];
+    buf.read(off, &mut got).unwrap();
+    assert_eq!(got, [42, 0, 0, 0, 7, 0, 0, 0]);
+}
+
+#[test]
+fn read_packed_handles_sparse_and_dense_multiword_masks() {
+    let empty: Vec<u32> = vec![0, 0];
+    let (vals, pref) = read_packed(&|_, _| panic!("no reads on empty mask"), 0, &empty).unwrap();
+    assert!(vals.is_empty());
+    assert_eq!(pref, vec![0, 0]);
+
+    // Sparse across word boundaries: bit 31 of word 0 (w=31), bit 0 of word 1 (w=32), and bit 5 of word 2 (w=69).
+    let mask = [1u32 << 31, 1u32, 1u32 << 5];
+    let mem: Vec<u8> = (0u32..96).flat_map(|w| w.to_le_bytes()).collect();
+    let reader = |addr: u64, dst: &mut [u8]| {
+        let start = (addr - 0x1000) as usize;
+        dst.copy_from_slice(&mem[start..start + dst.len()]);
+        true
+    };
+    let (vals, pref) = read_packed(&reader, 0x1000, &mask).unwrap();
+    assert_eq!(vals, vec![31, 32, 69]);
+    assert_eq!(pref, vec![0, 1, 2]);
+}
+
+#[test]
+fn large_rw_buffer_up_to_max_bytes_stays_candidate_and_demote_stops_snapshot_oscillation() {
+    assert_eq!(MAX_BYTES, SNAPSHOT_MAX_BYTES);
+    let size = 196_608u32;
+    let g = Guest(RefCell::new(vec![0u8; size as usize + 0x200]));
+
+    let mut rw_st = State::default();
+    rw_st.candidate(SUM, size);
+    assert!(rw_st.cands.contains_key(&SUM));
+
+    // Once promoted to `Snapshot` with accumulated hits, `demote` must clear `ro` so flushes do not re-promote it.
+    let mut ro_st = State::default();
+    ro_st.watch_read_only(SUM, size);
+    let cand = ro_st.cands.get_mut(&SUM).unwrap();
+    cand.learn.set(Class::Snapshot);
+    cand.hits = SNAPSHOT_HITS;
+    assert!(ro_st.demote(SUM));
+    assert_eq!(ro_st.cands[&SUM].learn.class(), Class::Never);
+    assert!(!ro_st.cands[&SUM].ro);
+    assert!(ro_st.cands[&SUM].sample.is_none());
+
+    let bound = [(SUM, size)];
+    for fence in 1..=LEARN_PERIOD * 2 {
+        let f = ro_st.flush(
+            fence,
+            &bound,
+            &|r| vec![false; r.len()],
+            &|| Vec::new(),
+            &|a, b| g.read(a, b),
+        );
+        assert!(f.renamed.iter().all(|r| r.kind != Kind::Snapshot));
+        assert!(!ro_st.is_snapshot(SUM));
+        assert_eq!(ro_st.cands[&SUM].learn.class(), Class::Never);
+    }
+}

@@ -94,7 +94,9 @@ pub(crate) fn sign(path: &Path) -> Result<(), String> {
     ))
 }
 
-/// Lays out `Info.plist` and `MacOS/nxkit-host` in the bundle `app` and signs the program. Returns the run folder,
+/// Lays out `MacOS/nxkit-host`, signs the program, and then writes `Info.plist` in the bundle `app`.
+/// Signing before writing `Info.plist` signs only the Mach-O binary (`Sealed Resources=none`) without creating a stale
+/// `Contents/_CodeSignature/CodeResources` before resources are populated. Returns the run folder,
 /// `Contents/Resources/nxkit`.
 pub(crate) fn skeleton(app: &Path, host: &Path, plist: &str) -> Result<PathBuf, String> {
     let (contents, run) = (app.join("Contents"), app.join("Contents/Resources/nxkit"));
@@ -102,11 +104,19 @@ pub(crate) fn skeleton(app: &Path, host: &Path, plist: &str) -> Result<PathBuf, 
     for d in [&macos, &run] {
         std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
     }
-    std::fs::write(contents.join("Info.plist"), plist)
-        .map_err(|e| format!("{}: {e}", contents.join("Info.plist").display()))?;
     let to = macos.join(HOST);
-    std::fs::copy(host, &to).map_err(|e| format!("{}: {e}", host.display()))?;
+    let bytes = std::fs::read(host).map_err(|e| format!("{}: {e}", host.display()))?;
+    std::fs::write(&to, &bytes).map_err(|e| format!("{}: {e}", to.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&to, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("{}: {e}", to.display()))?;
+    }
+    let _ = std::fs::remove_file(macos.join("._nxkit-host"));
     sign(&to)?;
+    let plist_path = contents.join("Info.plist");
+    std::fs::write(&plist_path, plist).map_err(|e| format!("{}: {e}", plist_path.display()))?;
     Ok(run)
 }
 
@@ -133,5 +143,31 @@ mod tests {
         let e = host(None, Path::new("/nonexistent/nxb")).unwrap_err();
         assert!(e.contains("NXB_NXKIT_HOST"));
         assert!(host(Some("/nonexistent/h"), Path::new("/x/nxb")).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn skeleton_signs_host_before_plist_and_cleans_appledouble() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("nxb-bundle-skel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let app = root.join("Game.app");
+        let macos = app.join("Contents/MacOS");
+        std::fs::create_dir_all(&macos).unwrap();
+        std::fs::write(macos.join("._nxkit-host"), b"appledouble").unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let plist = info_plist("Game", "org.nxkit.game.1", "0");
+        let run = skeleton(&app, &exe, &plist).unwrap();
+        assert_eq!(run, app.join("Contents/Resources/nxkit"));
+        assert!(!macos.join("._nxkit-host").exists());
+        assert!(!app.join("Contents/_CodeSignature").exists());
+        assert!(app.join("Contents/Info.plist").is_file());
+        let mode = std::fs::metadata(macos.join(HOST))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use nxkit_metal::{Context, DataBuffer, GuestSpace};
 use nxkit_nvn::counters::{FrameCounters, Source, counted_draws, primitives, source};
-use nxkit_nvn::frame::{Cmd, Frame};
+use nxkit_nvn::frame::{Cmd, CondOperand, Frame};
 use nxkit_nvn::passes::{PassKind, PassPlan};
 
 use crate::detail::{DrawArgs, FrameDetail};
@@ -65,6 +65,18 @@ struct CpuCount {
     primitives: Option<u64>,
 }
 
+/// Resolved same-frame GPU occlusion condition for a single draw ordinal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ResolvedGpuCond {
+    pub(crate) mode: u32,
+    pub(crate) offsets_a: [u32; 4],
+    pub(crate) count_a: u8,
+    pub(crate) const_a: u64,
+    pub(crate) offsets_b: [u32; 4],
+    pub(crate) count_b: u8,
+    pub(crate) const_b: u64,
+}
+
 /// The counters of one encoded frame, until the GPU finished it.
 pub(crate) struct FrameQueries {
     counters: FrameCounters,
@@ -81,6 +93,8 @@ pub(crate) struct FrameQueries {
     expected: Vec<u32>,
     encoded: Vec<AtomicU32>,
     cpu: Vec<CpuCount>,
+    /// Same-frame GPU render conditions keyed by draw ordinal.
+    draw_gpu_cond: FastMap<u32, ResolvedGpuCond>,
     /// The mesh draws of `NXKIT_DIAG=meshvis`, with offsets after those of the reports.
     mesh: Option<Box<dyn crate::probe::MeshCounts>>,
 }
@@ -228,6 +242,82 @@ pub(crate) fn prepare(
         draw_slot.iter_mut().for_each(|d| *d = None);
         pass_offsets.clear();
     }
+    let mut draw_gpu_cond = FastMap::default();
+    if buffer.is_some() && !frame.gpu_conds.is_empty() && !crate::knob("rcnogpu") {
+        let mut slot_vis: Vec<Vec<(usize, u32)>> = vec![Vec::new(); slots];
+        for (&pi, mine) in &pass_offsets {
+            for &(slot, off) in mine {
+                if let Some(v) = slot_vis.get_mut(slot as usize) {
+                    v.push((pi, off));
+                }
+            }
+        }
+        let resolve_op = |op: CondOperand, target_pass: usize| -> Option<(u8, [u32; 4], u64)> {
+            match op {
+                CondOperand::Const(v) => Some((0, [0; 4], v)),
+                CondOperand::SameFrameWrite(w_idx) => {
+                    let w = c.writes.get(w_idx as usize)?;
+                    if source(w.kind) != Source::Samples {
+                        return None;
+                    }
+                    let mut offsets = [0u32; 4];
+                    let mut count = 0usize;
+                    for &s in c.sums_of(w) {
+                        let exp = expected.get(s as usize).copied().unwrap_or(0);
+                        if exp == 0 {
+                            continue;
+                        }
+                        let vis_entries = slot_vis.get(s as usize).filter(|v| !v.is_empty())?;
+                        for &(src_pass, off) in vis_entries {
+                            if src_pass >= target_pass || count == 4 {
+                                return None;
+                            }
+                            offsets[count] = off;
+                            count += 1;
+                        }
+                    }
+                    Some((count as u8, offsets, 0))
+                }
+            }
+        };
+        for (pi, p) in plan.passes.iter().enumerate() {
+            if p.kind != PassKind::Render {
+                continue;
+            }
+            for cmd_idx in p.cmds.clone() {
+                if !matches!(frame.cmds.get(cmd_idx as usize), Some(Cmd::Draw { .. })) {
+                    continue;
+                }
+                let Some(gc) = frame.gpu_cond(cmd_idx) else {
+                    continue;
+                };
+                let Some(ord) = ords.get(cmd_idx as usize) else {
+                    continue;
+                };
+                let Some((count_a, offsets_a, const_a)) = resolve_op(gc.a, pi) else {
+                    continue;
+                };
+                let Some((count_b, offsets_b, const_b)) = resolve_op(gc.b, pi) else {
+                    continue;
+                };
+                if count_a == 0 && count_b == 0 {
+                    continue;
+                }
+                draw_gpu_cond.insert(
+                    ord.draw,
+                    ResolvedGpuCond {
+                        mode: gc.mode,
+                        offsets_a,
+                        count_a,
+                        const_a,
+                        offsets_b,
+                        count_b,
+                        const_b,
+                    },
+                );
+            }
+        }
+    }
     Some(Arc::new(FrameQueries {
         counters: c.clone(),
         pool: pool.clone(),
@@ -238,6 +328,7 @@ pub(crate) fn prepare(
         expected,
         encoded: (0..slots).map(|_| AtomicU32::new(0)).collect(),
         cpu,
+        draw_gpu_cond,
         mesh,
     }))
 }
@@ -332,6 +423,11 @@ impl FrameQueries {
     /// The slot that counts the samples of draw `n` (an ordinal).
     pub(crate) fn draw_slot(&self, n: u32) -> Option<u32> {
         self.draw_slot.get(n as usize).copied().flatten()
+    }
+
+    /// Same-frame GPU occlusion condition resolved for draw ordinal `n`.
+    pub(crate) fn gpu_cond(&self, draw_ord: u32) -> Option<ResolvedGpuCond> {
+        self.draw_gpu_cond.get(&draw_ord).copied()
     }
 
     /// The encoder encoded a draw of `slot`.

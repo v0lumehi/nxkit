@@ -190,7 +190,7 @@ fn gpus(a: &Args, work: &Path, profile: &Path) -> Result<Vec<String>, String> {
 /// engine keeps the save outside the app (`~/Library/Application Support/nxnative/<title id>/save` or the
 /// library folder's `save/<title id>`), so replacing its app loses no save: the stage `bundle` copies it into the new
 /// app (`nxnative.rs`).
-fn replaceable(out: &Path) -> Result<(), String> {
+pub(super) fn replaceable(out: &Path) -> Result<(), String> {
     let nxkit = out.join("Contents/MacOS/nxkit-host").is_file();
     if !out.exists() || nxkit || nxnative::is_app(out) {
         return Ok(());

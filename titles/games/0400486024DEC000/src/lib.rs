@@ -85,6 +85,10 @@ const SETTINGS: Fact<Settings> = Fact::new(
         // GPU foliage culling raced with frame N). With `rendercond_stale` off the picture is right with the overlap
         // on (Kokiri Forest, 2026-11-23): no blotches in that run.
         overlap: true,
+        // Measured on nxkit (M2 Max, Kokiri Forest, 2026-11-26): encoding on a dedicated thread runs main (~11 ms)
+        // and encode (~11 ms) in parallel instead of serializing to ~20 ms, keeping steady ~47 fps with zero flicker
+        // or blotches.
+        enc_thread: true,
         rec_lock: false,
         // `steady`: the step stays at the target. With `work` a late frame raised the hold to 2 or 3 vsyncs, the GPU
         // lowered its clock for the idle time, and the frames got so slow that the hold never came back (17 fps).

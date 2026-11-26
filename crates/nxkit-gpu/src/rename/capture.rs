@@ -25,6 +25,7 @@ impl Renamer {
                 force |= 1 << i;
             }
         }
+        let read = self.reader();
         if st.cands.is_empty() && st.keys.is_empty() {
             let all = force >> 6 & 1 != 0;
             self.honest
@@ -32,7 +33,20 @@ impl Renamer {
             self.honest_why.store(4, Ordering::Relaxed);
             self.forced_mask
                 .store(if all { 1 << 6 } else { 0 }, Ordering::Relaxed);
-            return (None, None);
+            drop(st);
+            let indirects = if crate::knob("renameoff") {
+                Vec::new()
+            } else {
+                collect_indirects(detail, &[], &copy_writes(detail), &[], &read)
+            };
+            let capture = (!indirects.is_empty()).then(|| Capture {
+                fence,
+                ranges: Vec::new(),
+                sampled: false,
+                epoch: self.wait_epoch.load(Ordering::Acquire),
+                indirects,
+            });
+            return (capture, None);
         }
         let t_bind = crate::diag("rename").then(std::time::Instant::now);
         let (bindings, bound) = st.bindings(detail);
@@ -44,7 +58,6 @@ impl Renamer {
         st.conflict_wait = crate::knob("conflictwait");
         st.grow_conflict = crate::knob("growconflict");
         st.force = force & 0b11111;
-        let read = self.reader();
         let f = st.flush(
             fence,
             &bound,
@@ -173,7 +186,39 @@ impl Renamer {
         if f.snapshot_bytes != 0 {
             note_n(Reason::OverlapSnapshotBytes, f.snapshot_bytes);
         }
-        if f.renamed.is_empty() {
+        let ranges: Vec<CapRange> = f
+            .renamed
+            .into_iter()
+            .map(|x| CapRange {
+                addr: x.addr,
+                len: x.len,
+                start: x.start,
+                kind: x.kind,
+                cmask: x.cmask,
+                gmask: x.gmask,
+                rmask: x.rmask,
+                cvals: x.cvals,
+                cprefix: x.cprefix,
+            })
+            .collect();
+        let indirects = if crate::knob("renameoff") {
+            Vec::new()
+        } else {
+            let gpu_cands: Vec<(u64, u64)> = st
+                .cands
+                .iter()
+                .filter(|&(_, c)| !c.ro)
+                .map(|(&a, c)| (a, a.saturating_add(u64::from(c.size))))
+                .collect();
+            drop(st);
+            let cw = if has_indirect(detail) {
+                copy_writes(detail)
+            } else {
+                Vec::new()
+            };
+            collect_indirects(detail, &ranges, &cw, &gpu_cands, &read)
+        };
+        if ranges.is_empty() && indirects.is_empty() {
             return (None, Some(check));
         }
         let sampled = crate::diag("rename")
@@ -182,21 +227,8 @@ impl Renamer {
             fence,
             sampled,
             epoch: self.wait_epoch.load(Ordering::Acquire),
-            ranges: f
-                .renamed
-                .into_iter()
-                .map(|x| CapRange {
-                    addr: x.addr,
-                    len: x.len,
-                    start: x.start,
-                    kind: x.kind,
-                    cmask: x.cmask,
-                    gmask: x.gmask,
-                    rmask: x.rmask,
-                    cvals: x.cvals,
-                    cprefix: x.cprefix,
-                })
-                .collect(),
+            ranges,
+            indirects,
         };
         (Some(capture), Some(check))
     }
@@ -204,14 +236,17 @@ impl Renamer {
     /// The encode of a frame in batch slot `region`, after the batch ring waited for the slot. Writes back the frame that
     /// the slot held before, puts the bytes of the capture into the slot's buffer and returns where the bindings read
     /// them, and the buffer, which the batch must keep alive. A range that lies in a pool that raw global writes
-    /// touched (`learned`) is not renamed.
+    /// touched (`learned`) or a shader/copy write (`gpu_writes`) is not renamed.
     pub(crate) fn begin_slot(
         &self,
         region: usize,
         capture: Option<&Arc<Capture>>,
         learned: &[(u64, u64)],
+        gpu_writes: &[(u64, u64)],
     ) -> Slotted {
-        self.timed(4, || self.begin_slot_inner(region, capture, learned))
+        self.timed(4, || {
+            self.begin_slot_inner(region, capture, learned, gpu_writes)
+        })
     }
 
     fn begin_slot_inner(
@@ -219,11 +254,13 @@ impl Renamer {
         region: usize,
         capture: Option<&Arc<Capture>>,
         learned: &[(u64, u64)],
+        gpu_writes: &[(u64, u64)],
     ) -> Slotted {
         let none = || Slotted {
             map: RenameMap::new(),
             buf: None,
             merges: Vec::new(),
+            indirect_snaps: FastMap::default(),
         };
         let off = crate::knob("renameoff");
         let mut slots = lock(&self.slots);
@@ -270,7 +307,24 @@ impl Renamer {
         if left != 0 {
             note_n(Reason::OverlapRenameExcluded, left);
         }
-        if offsets.is_empty() {
+        let mut ind_offsets: Vec<(usize, u64, u32, u64)> = Vec::new();
+        for (idx, (addr, len, _)) in cap.indirects.iter().enumerate() {
+            let end = addr.saturating_add(u64::from(*len));
+            let span = (*addr, end);
+            let covered_by_rename = offsets.iter().any(|&(ri, _)| {
+                let r = &cap.ranges[ri];
+                r.addr <= *addr && end <= r.addr.saturating_add(u64::from(r.len))
+            });
+            if covered_by_rename
+                || learned.iter().any(|&l| overlaps(span, l))
+                || gpu_writes.iter().any(|&w| overlaps(span, w))
+            {
+                continue;
+            }
+            ind_offsets.push((idx, *addr, *len, total));
+            total += u64::from(*len).next_multiple_of(ALIGN);
+        }
+        if offsets.is_empty() && ind_offsets.is_empty() {
             return none();
         }
         if slot.buf.as_ref().is_none_or(|b| b.len() < total) {
@@ -306,6 +360,15 @@ impl Renamer {
                 }
                 _ => {}
             }
+        }
+        let mut indirect_snaps = FastMap::default();
+        indirect_snaps.reserve(ind_offsets.len());
+        for (idx, addr, len, off) in ind_offsets {
+            let bytes = &cap.indirects[idx].2;
+            if buf.write(off, bytes).is_err() {
+                return none();
+            }
+            indirect_snaps.insert((addr, len), buf.gpu_address() + off);
         }
         // The ranges whose words the host writes back in the wait: a renamed range, and the words that the CPU and the GPU
         // both write of a merge range.
@@ -360,6 +423,7 @@ impl Renamer {
                     (cap.clone(), idx, addr, size, slot_real, copy2)
                 })
                 .collect(),
+            indirect_snaps,
         }
     }
 
@@ -437,17 +501,20 @@ impl Renamer {
             }
             let at = r.addr - base;
             let mut shown = 0;
-            let words = r.len as usize / 4;
             let mut chains = lock(&self.chains);
             let prev = chains.remove(&r.addr);
-            let mut wrote: Vec<Option<u32>> = vec![None; words];
+            let mut wrote: Vec<(u32, u32)> = Vec::new();
             let (mut w, mut sk) = (0, 0);
             for (i, cur, new) in written_words(r, &end) {
                 let word = at + 4 * i as u64;
                 let guest = self.guest.load_u32(word).unwrap_or(0);
-                let before = prev
-                    .as_ref()
-                    .and_then(|c| c.wrote.get(i).copied().flatten());
+                let idx = i as u32;
+                let before = prev.as_ref().and_then(|c| {
+                    c.wrote
+                        .binary_search_by_key(&idx, |&(w, _)| w)
+                        .ok()
+                        .map(|k| c.wrote[k].1)
+                });
                 let same = prev.as_ref().is_some_and(|c| c.epoch == p.cap.epoch);
                 let swap = decide_word(guest, cur, new, before, same);
                 let done = swap.is_some_and(|v| {
@@ -455,8 +522,8 @@ impl Renamer {
                         .compare_exchange_u32(word, guest, v)
                         .unwrap_or(false)
                 });
-                if done {
-                    wrote[i] = swap;
+                if let Some(v) = swap.filter(|_| done) {
+                    wrote.push((idx, v));
                     w += 1;
                 } else {
                     sk += 1;

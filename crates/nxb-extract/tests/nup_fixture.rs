@@ -516,3 +516,183 @@ fn invalid_addon_records_are_rejected_by_each_consumer() {
     }
     std::fs::remove_dir_all(d).unwrap();
 }
+
+#[test]
+fn switch2_edition_multi_base_and_001_ids() {
+    use nxb_extract::nup::{Nup, UnpackRequest, scan, scan_for, scan_with, unpack_nup};
+    let d = tmp("sw2-edition");
+    let sw1_app = 0x0100_1111_2222_0000u64;
+    let sw2_app = 0x0400_FF50_0E34_A001u64;
+    let code_for = |pid: u64, tag: &[u8]| {
+        vec![
+            Node::File("main", tag.to_vec(), true),
+            Node::File("main.npdm", npdm(pid), false),
+        ]
+    };
+    let pkgs = [
+        Pkg {
+            title: sw1_app,
+            kind: 0,
+            version: 0,
+            flags: 0,
+            exefs: Some(code_for(sw1_app, b"sw1-base")),
+            romfs: Some(vec![Node::File("sw1.txt", b"one".to_vec(), false)]),
+            meta: vec![],
+        },
+        Pkg {
+            title: sw1_app | 0x800,
+            kind: 1,
+            version: 65536,
+            flags: 0,
+            exefs: Some(code_for(sw1_app, b"sw1-upd")),
+            romfs: Some(vec![Node::File("sw1.txt", b"one-upd".to_vec(), false)]),
+            meta: vec![],
+        },
+        Pkg {
+            title: sw1_app + 0x1001,
+            kind: 2,
+            version: 1,
+            flags: 0,
+            exefs: None,
+            romfs: Some(vec![Node::File("dlc1.txt", b"s1d1".to_vec(), false)]),
+            meta: vec![],
+        },
+        Pkg {
+            title: sw2_app,
+            kind: 0,
+            version: 0,
+            flags: 0,
+            exefs: Some(code_for(sw2_app, b"sw2-base")),
+            romfs: Some(vec![Node::File("sw2.txt", b"two".to_vec(), false)]),
+            meta: vec![],
+        },
+        Pkg {
+            title: sw2_app | 0x800,
+            kind: 1,
+            version: 131072,
+            flags: 0,
+            exefs: Some(code_for(sw2_app, b"sw2-upd")),
+            romfs: Some(vec![Node::File("sw2.txt", b"two-upd".to_vec(), false)]),
+            meta: vec![],
+        },
+        Pkg {
+            title: (sw2_app & !0xFFF) + 0x1001,
+            kind: 2,
+            version: 1,
+            flags: 0,
+            exefs: None,
+            romfs: Some(vec![Node::File("dlc2.txt", b"s2d1".to_vec(), false)]),
+            meta: vec![],
+        },
+    ];
+    let path = d.join("sw2_edition.nup");
+    std::fs::write(&path, build(&pkgs, false)).unwrap();
+    let n = Nup::open(&path).unwrap();
+
+    // Default scan selects the unique Switch 2 Edition base and scopes updates and DLC to it.
+    let s = scan(&n).unwrap();
+    assert_eq!(s.app, sw2_app);
+    assert_eq!(s.base, Some(3));
+    assert_eq!(s.updates.keys().copied().collect::<Vec<_>>(), vec![131072]);
+    assert_eq!(
+        s.dlc.keys().copied().collect::<Vec<_>>(),
+        vec![(sw2_app & !0xFFF) + 0x1001]
+    );
+    assert_eq!(scan_with(&n, true).unwrap().app, sw2_app);
+
+    // Explicit `want` can select either base.
+    let s1 = scan_for(&n, false, Some(sw1_app)).unwrap();
+    assert_eq!(s1.app, sw1_app);
+    assert_eq!(s1.base, Some(0));
+    assert_eq!(s1.updates.keys().copied().collect::<Vec<_>>(), vec![65536]);
+    assert_eq!(
+        s1.dlc.keys().copied().collect::<Vec<_>>(),
+        vec![sw1_app + 0x1001]
+    );
+
+    let s2 = scan_for(&n, true, Some(sw2_app)).unwrap();
+    assert_eq!(s2.app, sw2_app);
+
+    assert!(scan_for(&n, false, Some(0x0100_0000_0000_9000)).is_err());
+
+    // Unpack + extract map Switch 2 Edition DLC `...B001` to index 1 (not 0).
+    let work = d.join("work");
+    extract_nup(&req(&path, &work)).unwrap();
+    assert!(work.join("aoc/1.img").is_file());
+    assert!(!work.join("aoc/0.img").exists());
+    let unpacked = unpack_nup(&UnpackRequest {
+        newest_dlc: true,
+        ..loose_request(&path, &work)
+    })
+    .unwrap();
+    assert_eq!(unpacked.dlc, vec![((sw2_app & !0xFFF) + 0x1001, 1)]);
+    assert_eq!(
+        std::fs::read(work.join("loose/aoc/1/dlc2.txt")).unwrap(),
+        b"s2d1"
+    );
+
+    // Two Switch 2 bases without `want` asks for `--title-id`; with `want` it succeeds.
+    let sw2_alt = 0x0400_E950_0403_8001u64;
+    let two_sw2 = d.join("two_sw2.nup");
+    std::fs::write(
+        &two_sw2,
+        build(
+            &[
+                Pkg {
+                    title: sw2_app,
+                    kind: 0,
+                    version: 0,
+                    flags: 0,
+                    exefs: Some(code_for(sw2_app, b"a")),
+                    romfs: Some(romfs(1)),
+                    meta: vec![],
+                },
+                Pkg {
+                    title: sw2_alt,
+                    kind: 0,
+                    version: 0,
+                    flags: 0,
+                    exefs: Some(code_for(sw2_alt, b"b")),
+                    romfs: Some(romfs(2)),
+                    meta: vec![],
+                },
+            ],
+            false,
+        ),
+    )
+    .unwrap();
+    let n2 = Nup::open(&two_sw2).unwrap();
+    let Err(err) = scan(&n2) else {
+        panic!("ambiguous two-Switch-2-base scan succeeded");
+    };
+    let err = err.to_string();
+    assert!(err.contains("--title-id"), "{err}");
+    assert!(err.contains(&format!("{sw2_app:016X}")), "{err}");
+    assert!(err.contains(&format!("{sw2_alt:016X}")), "{err}");
+    assert_eq!(scan_for(&n2, false, Some(sw2_alt)).unwrap().app, sw2_alt);
+
+    // Invalid base IDs (Switch 1 `...001`, Switch 2 `...800`) are still rejected.
+    for bad_id in [0x0100_0000_0000_0001u64, 0x0400_0000_0000_0800u64] {
+        let bad_nup = d.join(format!("bad_{bad_id:016X}.nup"));
+        std::fs::write(
+            &bad_nup,
+            build(
+                &[Pkg {
+                    title: bad_id,
+                    kind: 0,
+                    version: 0,
+                    flags: 0,
+                    exefs: Some(code_for(bad_id, b"m")),
+                    romfs: Some(romfs(1)),
+                    meta: vec![],
+                }],
+                false,
+            ),
+        )
+        .unwrap();
+        let nb = Nup::open(&bad_nup).unwrap();
+        assert!(scan(&nb).is_err(), "accepted invalid base ID {bad_id:016X}");
+    }
+
+    std::fs::remove_dir_all(d).unwrap();
+}

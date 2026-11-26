@@ -123,12 +123,17 @@ pub(super) fn analyze(game: &extract::Extracted) -> Result<Analysis, String> {
     let bases = layout::bases(&built.iter().map(|m| m.shape.clone()).collect::<Vec<_>>());
     let mut settings = nxtitle::Settings::DEFAULT;
     let resource = game.npdm.get(0x14..0x18).ok_or("truncated NPDM")?;
+    let (reserve, alias, stack, app_pool) = if game.title_id >> 56 == 0x04 {
+        (0x3_2000_0000, 0x1_0000_0000, 0x1000_0000, 0x2_4000_0000)
+    } else {
+        (4 << 30, 256 << 20, 256 << 20, 3 << 30)
+    };
     // These are host defaults, not game-specific requirements inferred from the binary.
     settings.memory = nxtitle::Memory {
-        reserve: 4 << 30,
-        alias: 256 << 20,
-        stack: 256 << 20,
-        app_pool: 3 << 30,
+        reserve,
+        alias,
+        stack,
+        app_pool,
         used: 64 << 20,
         system_resource: u32::from_le_bytes(
             resource.try_into().map_err(|_| "invalid NPDM resource")?,
@@ -148,10 +153,14 @@ pub(super) fn analyze(game: &extract::Extracted) -> Result<Analysis, String> {
                 .get(m.parts[1].0..m.parts[1].0.saturating_add(m.parts[1].1))
         })
         .collect();
-    let paths = game
-        .files
-        .iter()
-        .filter_map(|(n, _)| n.strip_prefix("romfs/"));
+    let paths: Vec<&str> = if !game.romfs_paths.is_empty() {
+        game.romfs_paths.iter().map(String::as_str).collect()
+    } else {
+        game.files
+            .iter()
+            .filter_map(|(n, _)| n.strip_prefix("romfs/"))
+            .collect()
+    };
     let mut found = engine_scan::hits(&catalog, ro, paths);
     if built
         .iter()
@@ -317,14 +326,28 @@ mod tests {
             files: vec![],
             directories: vec![],
             aoc: vec![],
+            romfs_dir: None,
+            romfs_overlay: None,
+            aoc_dirs: vec![],
+            romfs_paths: vec![],
+            _scratch: None,
         };
         let result = analyze(&game).unwrap();
         assert_eq!(result.modules[0].0.build_id, "01".repeat(16));
         assert_eq!(result.thread.stack_size, 0x100000);
         assert_eq!(result.settings.memory.system_resource, 0x200000);
+        assert_eq!(result.settings.memory.app_pool, 3 << 30);
         let json = result.manifest(&game);
         assert!(!json.contains("patches.toml"));
         assert!(json.contains("Synthetic"));
+        game.title_id = 0x040000000000abcd;
+        game.romfs_paths = vec!["Data/Managed/Metadata/global-metadata.dat".into()];
+        let sw2 = analyze(&game).unwrap();
+        assert_eq!(sw2.settings.memory.reserve, 0x3_2000_0000);
+        assert_eq!(sw2.settings.memory.alias, 0x1_0000_0000);
+        assert_eq!(sw2.settings.memory.stack, 0x1000_0000);
+        assert_eq!(sw2.settings.memory.app_pool, 0x2_4000_0000);
+        assert!(sw2.engine_hits.contains(&"Unity"));
         game.modules[0].1.truncate(0x4f);
         assert!(analyze(&game).is_err());
     }

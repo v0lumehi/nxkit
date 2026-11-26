@@ -388,6 +388,7 @@ Knobs are experiments. A frame with a knob does not render correctly. Use knobs 
 | `nobarrier` | Gives no pass a barrier. The picture is wrong. The knob measures what the barriers cost the GPU. |
 | `rcflag` | A render condition whose two operands both are plain guest memory (not a report of the table) renders. Tells whether the memory conditions leave out work that the console does not. The decisions it forced are counted on the `rendercond` frame line (`forced decisions rcflag N`). |
 | `rcunk` | A render condition with an unknown result (a counter only the GPU knows, or `NXKIT_COUNTERS=0`) is left out instead of rendered. |
+| `rcnogpu` | Same-frame GPU conditional rendering (`nxkit_cond_draw`) is disabled. Unknown conditions render unconditionally. |
 | `rcall` | Every `SetRenderEnableConditional` renders. `SetRenderEnable` is not changed: the front end records it as a plain on or off mark, and it has no operands to compare. It wins over `rcflag` and `rcunk`. |
 | `rcnostale` | The same as `NXKIT_RENDERCOND_STALE=0`, switched while the game runs: a condition reads no counter of an earlier report. |
 | `rc3d` | The same as `NXKIT_RENDERCOND=3d`, switched while the game runs: a false condition leaves out draws and clears only. The front end marks the commands under a false condition when it appends a stream. The encoder chooses the commands when it encodes them, so the switch acts on the next frame. |

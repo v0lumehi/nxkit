@@ -51,6 +51,7 @@ mod tests {
             disabled: Vec::new(),
             counters: Default::default(),
             gates: Vec::new(),
+            gpu_conds: Vec::new(),
         };
         let mut plan = PassPlan::default();
         let mut table = ResourceTable::new();

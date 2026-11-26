@@ -64,7 +64,7 @@ impl State {
         let mut prev_ptr = 0usize;
         let mut prev_sig = 0u64;
         for (di, d) in detail.draws.iter().enumerate() {
-            if d.args.is_mesh() || d.sbufs.is_empty() {
+            if d.sbufs.is_empty() {
                 continue;
             }
             let ptr = Arc::as_ptr(d) as usize;
@@ -77,7 +77,17 @@ impl State {
                 ^ d.program
                     .fragment
                     .as_ref()
-                    .map_or(0, |f| Arc::as_ptr(f).cast::<u8>() as u64);
+                    .map_or(0, |f| Arc::as_ptr(f).cast::<u8>() as u64)
+                ^ d.program
+                    .task
+                    .as_ref()
+                    .map_or(0, |t| Arc::as_ptr(t).cast::<u8>() as u64)
+                    .rotate_left(13)
+                ^ d.program
+                    .mesh
+                    .as_ref()
+                    .map_or(0, |m| Arc::as_ptr(m).cast::<u8>() as u64)
+                    .rotate_left(19);
             for s in &d.sbufs {
                 sig = (sig.rotate_left(5) ^ s.address).wrapping_mul(0x9e37_79b9_7f4a_7c15)
                     ^ u64::from(s.size)
@@ -87,11 +97,14 @@ impl State {
                 continue;
             }
             prev_sig = sig;
+            let (mut ts, mut ms) = (None, None);
             for (si, s) in d.sbufs.iter().enumerate() {
                 let (k, memo) = match s.stage {
                     Stage::Vertex => (Some(&d.program.vertex), &mut vs),
                     Stage::Fragment => (d.program.fragment.as_ref(), &mut fs),
-                    _ => continue,
+                    Stage::Task => (d.program.task.as_ref(), &mut ts),
+                    Stage::Mesh => (d.program.mesh.as_ref(), &mut ms),
+                    Stage::Compute | Stage::Geometry => continue,
                 };
                 let Some(k) = k else { continue };
                 let ptr = Arc::as_ptr(k).cast::<u8>() as usize;
@@ -336,11 +349,14 @@ impl State {
     }
 
     /// A snapshot or merge range that the GPU or a copy writes in a way that the class cannot carry is state: `Never`.
+    /// Clears `ro` and `sample` so read-only flushes cannot immediately re-promote it back to `Snapshot`.
     /// Returns whether it was one.
     pub(super) fn demote(&mut self, addr: u64) -> bool {
         match self.cands.get_mut(&addr) {
             Some(c) if matches!(c.learn.class(), Class::Snapshot | Class::Merge) => {
                 c.learn.set(Class::Never);
+                c.ro = false;
+                c.sample = None;
                 true
             }
             _ => false,

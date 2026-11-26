@@ -127,6 +127,8 @@ pub(super) struct State {
     pub(super) dropped: inventory::Total,
     /// The ids whose Metal texture was superseded and not made again yet.
     ids: FastSet<TexId>,
+    /// Ids that were recreated after being superseded, kept pinned to avoid drop/recreate thrashing.
+    sticky: FastSet<TexId>,
     /// The ids that got a Metal texture again after that.
     pub(super) remade: u64,
     /// The remade ids by shape (format, width, height).
@@ -154,6 +156,7 @@ impl State {
     /// Counts the id in `shape` when it was superseded and not made again yet.
     fn count_remade(&mut self, id: TexId, shape: (nxkit_metal::Format, u32, u32), gpu_newer: bool) {
         if self.ids.remove(&id) {
+            self.sticky.insert(id);
             self.remade += 1;
             let c = self.shapes.entry(shape).or_default();
             c.remade += 1;
@@ -187,6 +190,7 @@ impl State {
     /// Forgets the id: the game made the texture again, so it is not "superseded and waiting" any more.
     pub(super) fn forget(&mut self, id: TexId) {
         self.ids.remove(&id);
+        self.sticky.remove(&id);
     }
 }
 
@@ -225,7 +229,7 @@ impl TextureStore {
                     || r.desc.depth > 1
                     || matches!(r.desc.kind, TextureKind::Cube | TextureKind::CubeArray),
             });
-            s.pinned |= self.pinned.contains(id);
+            s.pinned |= self.pinned.contains(id) || self.sup.sticky.contains(id);
             meta.entry(r.generation).or_insert((*id, r.desc));
         }
         let spans: Vec<Span> = spans.into_values().collect();
@@ -505,5 +509,17 @@ mod tests {
         let n = gone(&s, NOW).len();
         // Some of the cluster goes, never more than the textures that were there.
         assert!(n > 0 && n <= MAX_PARTNERS * 3);
+    }
+
+    #[test]
+    fn remade_id_becomes_sticky_until_forgotten() {
+        use nxkit_metal::Format;
+        let mut s = State::default();
+        let id = TexId(42);
+        s.ids.insert(id);
+        s.count_remade(id, (Format::Rg11B10Float, 1536, 864), false);
+        assert!(s.sticky.contains(&id));
+        s.forget(id);
+        assert!(!s.sticky.contains(&id));
     }
 }

@@ -4,7 +4,8 @@ use crate::{Args, events::Progress, graph::Build, inputs::Source};
 use nxb_extract::version;
 use std::path::{Path, PathBuf};
 
-const LIMIT: u64 = 256 << 20;
+const META_LIMIT: u64 = 512 << 20;
+const MEM_LIMIT: u64 = 1 << 30;
 fn err(e: nxb_extract::ExtractError) -> String {
     crate::exit::fail(e.exit_code(), e.to_string())
 }
@@ -19,35 +20,32 @@ pub(super) struct Extracted {
     pub files: Vec<(String, Vec<u8>)>,
     pub directories: Vec<String>,
     pub aoc: Vec<manifest::Aoc>,
+    pub romfs_dir: Option<PathBuf>,
+    pub romfs_overlay: Option<PathBuf>,
+    pub aoc_dirs: Vec<(u32, PathBuf)>,
+    pub romfs_paths: Vec<String>,
+    pub _scratch: Option<crate::host::TempDir>,
 }
 
 fn read(path: &Path, total: &mut u64) -> Result<Vec<u8>, String> {
     let size = std::fs::metadata(path).map_err(|e| io(path, e))?.len();
     *total = total
         .checked_add(size)
-        .filter(|n| *n <= LIMIT)
-        .ok_or("unsupported: extracted game exceeds the generic adapter 256 MiB limit")?;
+        .filter(|n| *n <= META_LIMIT)
+        .ok_or("unsupported: extracted metadata exceeds 512 MiB limit")?;
     std::fs::read(path).map_err(|e| io(path, e))
 }
 
-fn tree(
+fn collect_paths(
     root: &Path,
-    prefix: &str,
-    overlay: Option<&Path>,
-    game: &mut Extracted,
-    total: &mut u64,
+    skip_stamp: bool,
+    out: &mut std::collections::BTreeSet<String>,
 ) -> Result<(), String> {
     if !root.is_dir() {
         return Ok(());
     }
-    let mut pending = vec![PathBuf::new()];
-    while let Some(rel) = pending.pop() {
-        game.directories.push(if rel.as_os_str().is_empty() {
-            prefix.into()
-        } else {
-            format!("{prefix}/{}", rel.display())
-        });
-        let dir = root.join(&rel);
+    let mut pending = vec![(root.to_path_buf(), String::new())];
+    while let Some((dir, rel)) = pending.pop() {
         let mut entries = std::fs::read_dir(&dir)
             .map_err(|e| io(&dir, e))?
             .collect::<Result<Vec<_>, _>>()
@@ -59,23 +57,34 @@ fn tree(
                 .into_string()
                 .map_err(|_| "extracted filenames must be UTF-8")?;
             nxb_extract::safe_path::rel("extracted file", &name, true).map_err(err)?;
-            let rel = rel.join(name);
+            let next = if rel.is_empty() {
+                name
+            } else {
+                format!("{rel}/{name}")
+            };
+            if skip_stamp && next == crate::resource_patch::STAMP {
+                continue;
+            }
             let kind = e.file_type().map_err(|e| e.to_string())?;
             if kind.is_dir() {
-                pending.push(rel);
+                pending.push((e.path(), next));
             } else if kind.is_file() {
-                let path = overlay
-                    .map(|o| o.join(&rel))
-                    .filter(|p| p.is_file())
-                    .unwrap_or_else(|| e.path());
-                game.files
-                    .push((format!("{prefix}/{}", rel.display()), read(&path, total)?));
+                out.insert(next);
             } else {
                 return Err("extracted files must not contain symlinks or special files".into());
             }
         }
     }
     Ok(())
+}
+
+fn walk_paths(root: &Path, overlay: Option<&Path>) -> Result<Vec<String>, String> {
+    let mut paths = std::collections::BTreeSet::new();
+    collect_paths(root, false, &mut paths)?;
+    if let Some(o) = overlay {
+        collect_paths(o, true, &mut paths)?;
+    }
+    Ok(paths.into_iter().collect())
 }
 
 pub(super) fn extract(a: &Args, p: &Progress) -> Result<Extracted, String> {
@@ -116,7 +125,7 @@ pub(super) fn extract(a: &Args, p: &Progress) -> Result<Extracted, String> {
             romfs: loose.clone(),
             aoc: ex.join("aoc"),
             threads: a.threads,
-            mem_limit: LIMIT,
+            mem_limit: MEM_LIMIT,
             verify: true,
             split: None,
             progress: None,
@@ -134,7 +143,7 @@ pub(super) fn extract(a: &Args, p: &Progress) -> Result<Extracted, String> {
                     out_base: ex.clone(),
                     app: Some(b.src.app),
                     threads: a.threads,
-                    mem_limit: LIMIT,
+                    mem_limit: MEM_LIMIT,
                     ..Default::default()
                 },
                 *version,
@@ -159,7 +168,7 @@ pub(super) fn extract(a: &Args, p: &Progress) -> Result<Extracted, String> {
             base_outputs: b.updates.is_empty(),
             app: Some(b.src.app),
             threads: a.threads,
-            mem_limit: LIMIT,
+            mem_limit: MEM_LIMIT,
             empty_romfs: true,
             ..Default::default()
         })
@@ -175,7 +184,7 @@ pub(super) fn extract(a: &Args, p: &Progress) -> Result<Extracted, String> {
         let index = id - b.src.app - 0x1000;
         let out = ex.join(format!("aoc/{index}"));
         if nxb_extract::nup::is_nup(path) {
-            nxb_extract::nup::unpack_dlc(path, *id, *version, &out, LIMIT).map_err(err)?;
+            nxb_extract::nup::unpack_dlc(path, *id, *version, &out, MEM_LIMIT).map_err(err)?;
         } else {
             romfs::unpack(&work.join(format!("aoc/{index}.img")), &out, |_, _| {})?;
         }
@@ -186,6 +195,11 @@ pub(super) fn extract(a: &Args, p: &Progress) -> Result<Extracted, String> {
     if nxb_extract::nup::program_id(&npdm, "main.npdm").map_err(err)? != b.src.app {
         return Err("NPDM program ID does not match the application metadata".into());
     }
+    let romfs_paths = walk_paths(&loose, overlay.as_deref())?;
+    let mut directories = Vec::new();
+    if loose.is_dir() {
+        directories.push("romfs".into());
+    }
     let mut game = Extracted {
         title_id: b.src.app,
         name: format!("{:016X}", b.src.app),
@@ -194,8 +208,13 @@ pub(super) fn extract(a: &Args, p: &Progress) -> Result<Extracted, String> {
         npdm,
         modules: vec![],
         files: vec![],
-        directories: vec![],
+        directories,
         aoc: vec![],
+        romfs_dir: loose.is_dir().then_some(loose),
+        romfs_overlay: overlay,
+        aoc_dirs: vec![],
+        romfs_paths,
+        _scratch: None,
     };
     let exefs = ex.join("ExeFS");
     let mut modules = std::fs::read_dir(&exefs)
@@ -234,11 +253,15 @@ pub(super) fn extract(a: &Args, p: &Progress) -> Result<Extracted, String> {
             game.files.push((name.into(), bytes));
         }
     }
-    tree(&loose, "romfs", overlay.as_deref(), &mut game, &mut total)?;
     for (id, version, _) in &b.src.dlc {
         let index = u32::try_from(id - b.src.app - 0x1000).map_err(|e| e.to_string())?;
         let path = format!("aoc/{index}");
-        tree(&ex.join(&path), &path, None, &mut game, &mut total)?;
+        let dir = ex.join(&path);
+        walk_paths(&dir, None)?;
+        if dir.is_dir() {
+            game.directories.push(path.clone());
+        }
+        game.aoc_dirs.push((index, dir));
         game.aoc.push(manifest::Aoc {
             index,
             title_id: *id,
@@ -246,6 +269,7 @@ pub(super) fn extract(a: &Args, p: &Progress) -> Result<Extracted, String> {
             path,
         });
     }
+    game._scratch = Some(scratch);
     Ok(game)
 }
 

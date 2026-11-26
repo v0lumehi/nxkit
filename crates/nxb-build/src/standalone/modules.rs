@@ -88,8 +88,11 @@ pub(crate) fn rewrite_with_loader(
         let m = nso::load(&data, name).map_err(|e| err(name, e))?;
         let id = nxb_model::to_hex(&m.build_id[..16]);
         if id != *want_id {
-            return Err(format!(
-                "module {name}: build ID {id} is not the one the title module knows ({want_id}): this is another version of the game"
+            return Err(crate::exit::fail(
+                4,
+                format!(
+                    "module {name}: build ID {id} is not the one the title module knows ({want_id}): this is another version of the game"
+                ),
             ));
         }
         let symbols = elf::symbols(&m.image).map_err(|e| format!("module {name}: {e}"))?;

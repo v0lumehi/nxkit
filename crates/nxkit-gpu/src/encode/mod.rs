@@ -282,7 +282,15 @@ pub(crate) fn render_pass(
         return lost(stats, Skip::Copy);
     }
     // The GPU driven draws of the pass get their copied arguments before the pass starts.
-    let pre = crate::indirect::prepass(sh, cb, &tables.vertex, scratch, range.clone(), stats);
+    let pre = crate::indirect::prepass(
+        sh,
+        cb,
+        &tables.vertex,
+        scratch,
+        sh.queries,
+        range.clone(),
+        stats,
+    );
     // The draws of a slot of the GPU counters count their samples (`queries`).
     let vis = sh.queries.and_then(|q| Some((q, q.pass(index)?)));
     let visibility = vis.as_ref().map(|(_, v)| v.buffer);
@@ -383,6 +391,17 @@ pub(crate) fn render_pass(
             scope: Scope::FromEarlierPasses,
             after: Stages::DISPATCH | Stages::BLIT | Stages::FRAGMENT,
             before: Stages::VERTEX | Stages::OBJECT | Stages::MESH,
+            visibility: Visibility::Device,
+        };
+        match rp.encode(&RenderCommand::Depend(dep)) {
+            Ok(()) => stats.barriers_emitted += 1,
+            Err(_) => stats.skipped[Skip::Encode as usize] += 1,
+        }
+    } else if let Some(before) = pre.cond_stages {
+        let dep = Dependency {
+            scope: Scope::FromEarlierPasses,
+            after: Stages::DISPATCH,
+            before,
             visibility: Visibility::Device,
         };
         match rp.encode(&RenderCommand::Depend(dep)) {
@@ -500,17 +519,19 @@ pub(crate) fn render_pass(
             })
             .filter(|r| !clears.iter().any(|&(at, _)| at > n && at < n + r.draws))
             .filter(|r| !(n..n + r.draws).any(|d| is_capture(sh, d)))
-            && (n..n + run.draws).all(|d| !is_off(d) && counts(d).is_none())
+            && (n..n + run.draws).all(|d| {
+                !is_off(d)
+                    && counts(d).is_none()
+                    && !pre.cond_indirect.contains_key(&d)
+                    && !pre.cond_mesh.contains(&d)
+            })
             && set_counting(&mut rp, &mut counting, None, stats)
             && run_icb(sh, &s.pc, &mut rp, &mut tr, run, stats)
         {
             n += run.draws;
             continue;
         }
-        let want = counts(n);
-        let counted = vis.is_some() && set_counting(&mut rp, &mut counting, want, stats);
-        let before = stats.draws;
-        draw(
+        draw_counted(
             sh,
             &s.pc,
             &mut rp,
@@ -519,23 +540,12 @@ pub(crate) fn render_pass(
             &mut memo,
             &pre,
             &tables.object,
+            vis.as_ref(),
+            &counts,
+            &mut counting,
             n,
             stats,
         );
-        if counted
-            && want.is_some()
-            && stats.draws > before
-            && let Some(((q, _), slot)) = vis.as_ref().zip(sh.queries.and_then(|q| q.draw_slot(n)))
-        {
-            q.encoded(slot);
-        }
-        if counted
-            && want.is_some()
-            && stats.draws > before
-            && let Some((q, _)) = vis.as_ref()
-        {
-            q.mesh_encoded(n);
-        }
         n += 1;
     }
     clears_before(&mut rp, &mut tr, stats, range.end);

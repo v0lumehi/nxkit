@@ -303,6 +303,35 @@ impl CmdStream {
     }
 }
 
+/// One operand of a same-frame GPU render condition (`GpuCond`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CondOperand {
+    /// A value already known on the CPU at encode time.
+    Const(u64),
+    /// A `SamplesPassed` counter report written in this same frame, identified by its index in `FrameCounters::writes`.
+    SameFrameWrite(u32),
+}
+
+/// A render condition that compares at least one same-frame GPU occlusion query report against a constant or second report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GpuCond {
+    /// `RENDER_IF_EQUAL` (`0`) or `RENDER_IF_NOT_EQUAL` (`1`).
+    pub mode: u32,
+    /// First 64-bit operand (`addr`).
+    pub a: CondOperand,
+    /// Second 64-bit operand (`addr + 16`).
+    pub b: CondOperand,
+}
+
+/// Command range covered by a same-frame [`GpuCond`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GpuCondRange {
+    /// Command indices in `Frame::cmds`.
+    pub cmds: Range<u32>,
+    /// Condition to evaluate on the GPU before the render pass.
+    pub cond: GpuCond,
+}
+
 /// All commands between two presents.
 #[derive(Clone, Debug, Default)]
 pub struct Frame {
@@ -317,6 +346,8 @@ pub struct Frame {
     pub counters: FrameCounters,
     /// What each render condition covered. Filled only with `NXKIT_DIAG=rendercond`.
     pub gates: Vec<crate::rendercond::gate::Seg>,
+    /// Same-frame GPU conditional rendering ranges resolved against the frame's visibility buffer.
+    pub gpu_conds: Vec<GpuCondRange>,
 }
 
 /// True for a command that a false render condition leaves out: draws, clears, and unless `NXKIT_RENDERCOND=3d`,
@@ -351,6 +382,32 @@ impl Frame {
         self.disabled.clear();
         self.counters.clear();
         self.gates.clear();
+        self.gpu_conds.clear();
+    }
+
+    /// Appends a same-frame [`GpuCond`] covering `cmds`, coalescing adjacent identical conditions.
+    pub fn push_gpu_cond(&mut self, cmds: Range<u32>, cond: GpuCond) {
+        if cmds.is_empty() {
+            return;
+        }
+        match self.gpu_conds.last_mut() {
+            Some(last) if last.cond == cond && last.cmds.end >= cmds.start => {
+                last.cmds.end = last.cmds.end.max(cmds.end);
+            }
+            _ => self.gpu_conds.push(GpuCondRange { cmds, cond }),
+        }
+    }
+
+    /// Returns the same-frame [`GpuCond`] active at command index `i`, if any.
+    pub fn gpu_cond(&self, i: u32) -> Option<GpuCond> {
+        if self.gpu_conds.is_empty() {
+            return None;
+        }
+        let at = self.gpu_conds.partition_point(|r| r.cmds.end <= i);
+        self.gpu_conds
+            .get(at)
+            .filter(|r| r.cmds.start <= i)
+            .map(|r| r.cond)
     }
 
     /// Marks the commands of `r` as run under a false render condition. The ranges come in command order. One that

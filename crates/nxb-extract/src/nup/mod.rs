@@ -24,8 +24,11 @@ use crate::error::{ExtractError, Result};
 use crate::storage::{FileStorage, Storage};
 
 mod extract;
+mod scan;
+mod stream;
 mod unpack;
 pub use extract::{NupRequest, extract_nup, is_nup};
+pub use scan::{Scan, addon_records, scan, scan_for, scan_with};
 pub use unpack::{SplitStats, UnpackRequest, Unpacked, unpack_dlc, unpack_nup};
 
 pub(crate) const NO_DIR: u32 = 0xFFFF_FFFF;
@@ -39,8 +42,10 @@ pub(crate) const T_ICON: u16 = 3;
 pub(crate) const T_LICONS: u16 = 10;
 /// Upper bounds for the table of contents (a guard against crafted sizes).
 const MAX_TOC: u64 = 512 << 20;
-/// Upper bound for one file's size (read into memory when it is checked).
-const MAX_FILE: u64 = 8 << 30;
+/// Upper bound for one file's size.
+const MAX_FILE: u64 = 64 << 30;
+/// Upper bound for one file read into memory at once.
+const MAX_IN_MEMORY: u64 = 2 << 30;
 
 pub(crate) fn bad(path: &Path, m: impl AsRef<str>) -> ExtractError {
     ExtractError::format(format!("{}: {}", path.display(), m.as_ref()))
@@ -378,6 +383,12 @@ impl Nup {
     pub(crate) fn read_checked(&self, i: usize, sha: bool) -> Result<Vec<u8>> {
         let f = &self.files[i];
         let shown = String::from_utf8_lossy(&f.name).into_owned();
+        if f.size > MAX_IN_MEMORY {
+            return Err(bad(
+                &self.path,
+                format!("{shown} is too large to read into memory"),
+            ));
+        }
         let data = if f.size == 0 {
             Vec::new()
         } else {
@@ -438,160 +449,4 @@ pub fn program_id(npdm: &[u8], where_: &str) -> Result<u64> {
         return Err(ExtractError::format(format!("{where_}: no ACI0 section")));
     }
     Ok(u64le(aci, 0x10))
-}
-
-/// What a container holds: the title ID, the base package (none when an update holds the whole game), the updates by
-/// version and the DLC by title ID.
-pub struct Scan {
-    /// Program ID of the game.
-    pub app: u64,
-    /// Base package index.
-    pub base: Option<usize>,
-    /// Updates: version -> package index.
-    pub updates: BTreeMap<u32, usize>,
-    /// DLC: title ID -> package index.
-    pub dlc: BTreeMap<u64, usize>,
-}
-
-/// Complete addon trees, keyed by title and version. No delta layering is implied.
-/// Reserved `addon_update` records are refused because NUP v1 defines no extraction semantics for them.
-pub fn addon_records(n: &Nup) -> Result<BTreeMap<(u64, u32), usize>> {
-    let mut records = BTreeMap::new();
-    for package in &n.packages {
-        if package.kind == 3 {
-            return Err(ExtractError::Unsupported(
-                "addon_update is reserved by NUP v1 and has no defined extraction semantics".into(),
-            ));
-        }
-        if package.kind != ADDON {
-            continue;
-        }
-        let index = package.title_id & 0xfff;
-        if !(1..=2000).contains(&index) || (package.title_id & !0xfff) < 0x1000 {
-            return Err(bad(
-                &n.path,
-                format!("invalid DLC title ID {:016X}", package.title_id),
-            ));
-        }
-        if package.romfs == NO_DIR {
-            return Err(bad(
-                &n.path,
-                format!("DLC {:016X} has no RomFS", package.title_id),
-            ));
-        }
-        if records
-            .insert((package.title_id, package.version), package.index)
-            .is_some()
-        {
-            return Err(bad(
-                &n.path,
-                format!(
-                    "DLC {:016X} version {} is duplicated",
-                    package.title_id, package.version
-                ),
-            ));
-        }
-    }
-    Ok(records)
-}
-
-/// The engine's `scan`: the same checks and the same error texts.
-pub fn scan(n: &Nup) -> Result<Scan> {
-    scan_with(n, false)
-}
-
-/// Like [`scan`]. With `newest_dlc` (the generic path), [`addon_records`] reads the DLC records. Then several complete
-/// versions of one DLC title can be present, and the scan selects the newest.
-pub fn scan_with(n: &Nup, newest_dlc: bool) -> Result<Scan> {
-    let p = &n.path;
-    let bases: Vec<&Package> = n.packages.iter().filter(|k| k.kind == BASE).collect();
-    if bases.len() > 1 {
-        return Err(bad(p, format!("{} base packages", bases.len())));
-    }
-    let updates: Vec<&Package> = n.packages.iter().filter(|k| k.kind == UPDATE).collect();
-    if bases.is_empty() && (updates.is_empty() || updates.iter().any(|k| k.flags & STANDALONE == 0))
-    {
-        return Err(bad(
-            p,
-            "no base game: pack the base game and its update into one NUP, or use updates marked standalone_update with complete exefs/ and romfs/",
-        ));
-    }
-    let base = bases
-        .first()
-        .filter(|b| n.tree_bytes(b.root, 0) > 0)
-        .map(|b| b.index);
-    let mut ids = std::collections::BTreeSet::new();
-    for k in n
-        .packages
-        .iter()
-        .filter(|k| (k.kind == BASE || k.kind == UPDATE) && k.exefs != NO_DIR)
-    {
-        if let Some(i) = n.child(k.exefs, b"main.npdm") {
-            ids.insert(program_id(
-                &n.read(i)?,
-                &format!("{} exefs/main.npdm", k.name),
-            )?);
-        }
-    }
-    if ids.is_empty() {
-        return Err(bad(p, "no exefs/main.npdm in the base or updates"));
-    }
-    if ids.len() != 1 {
-        let l: Vec<String> = ids.iter().map(|x| format!("{x:016X}")).collect();
-        return Err(bad(
-            p,
-            format!(
-                "base and updates have different program IDs: {}",
-                l.join(", ")
-            ),
-        ));
-    }
-    let app = ids.into_iter().next().unwrap_or(0);
-    if app & 0xFFF != 0 {
-        return Err(bad(
-            p,
-            format!("base program ID {app:016X} is not a base title ID"),
-        ));
-    }
-    let family = |title: u64| {
-        let d = title.wrapping_sub(app).wrapping_sub(0x1000);
-        if !(1..=2000).contains(&d) || title < app.saturating_add(0x1000) {
-            return Err(bad(p, format!("{title:016X} is not a DLC of {app:016X}")));
-        }
-        Ok(())
-    };
-    let mut dlc = BTreeMap::new();
-    if newest_dlc {
-        // Ordered title/version keys make the newest complete tree win for each title.
-        for ((title, _), index) in addon_records(n)? {
-            family(title)?;
-            dlc.insert(title, index);
-        }
-    }
-    let mut vers = BTreeMap::new();
-    for k in &n.packages {
-        if k.kind == UPDATE {
-            if vers.contains_key(&k.version) {
-                return Err(bad(p, format!("two updates of version {}", k.version)));
-            }
-            if k.version == 0 {
-                return Err(bad(p, "an update of version 0"));
-            }
-            vers.insert(k.version, k.index);
-        } else if k.kind == ADDON && !newest_dlc {
-            family(k.title_id)?;
-            if k.romfs == NO_DIR {
-                return Err(bad(p, format!("DLC {:016X} has no romfs/", k.title_id)));
-            }
-            if dlc.insert(k.title_id, k.index).is_some() {
-                return Err(bad(p, format!("DLC {:016X} more than once", k.title_id)));
-            }
-        }
-    }
-    Ok(Scan {
-        app,
-        base,
-        updates: vers,
-        dlc,
-    })
 }

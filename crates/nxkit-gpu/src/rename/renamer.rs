@@ -158,8 +158,8 @@ impl Renamer {
         move |addr, buf| addr >= base && self.guest.read(addr - base, buf).is_ok()
     }
 
-    /// Looks at the storage bindings of an encoded frame and adds those that a shader may write (`rw` of the binding) and
-    /// that are small to the candidates. The bindings of a task or mesh stage are not looked at.
+    /// Looks at the storage bindings of an encoded frame, records those a shader may write (`rw` of the binding), and
+    /// also returns all GPU-written `(addr, end)` ranges of the frame (`copy_writes` plus `sbuf rw`) for filtering.
     pub(crate) fn note_rw(&self, detail: &FrameDetail, programs: &Programs) {
         self.timed(3, || {
             self.note_rw_with(
@@ -174,6 +174,79 @@ impl Renamer {
                 },
             );
         });
+    }
+
+    /// Calls [`Self::note_rw`] and, when the capture carries indirect-arg snapshots, also returns all GPU-written
+    /// `(addr, end)` intervals of `detail` (`copy_writes` plus any `sbuf` binding whose shader declares `rw`).
+    pub(crate) fn note_rw_writes(
+        &self,
+        detail: &FrameDetail,
+        programs: &Programs,
+    ) -> Vec<(u64, u64)> {
+        use std::hash::BuildHasher;
+        self.note_rw(detail, programs);
+        if detail
+            .rename
+            .as_ref()
+            .is_none_or(|c| c.indirects.is_empty())
+        {
+            return Vec::new();
+        }
+        let mut writes = copy_writes(detail);
+        let st = lock(&self.state);
+        let is_rw = |key: &str, vertex: bool, slot: u32, stage: Stage| -> bool {
+            let slot_stage = slot | (stage as u32) << 24;
+            let hash = foldhash::fast::FixedState::default().hash_one(key);
+            if let Some(&rw) = st.rw_str.get(&(hash, slot_stage)) {
+                return rw;
+            }
+            programs.stage(key, vertex).is_ok_and(|p| {
+                p.binds
+                    .iter()
+                    .any(|b| b.kind == BindKind::Sbuf && b.reg == slot && b.rw)
+            })
+        };
+        for d in &detail.draws {
+            for s in &d.sbufs {
+                if s.size == 0 || s.address == 0 {
+                    continue;
+                }
+                let rw = match s.stage {
+                    Stage::Vertex => is_rw(&d.program.vertex, true, s.slot, s.stage),
+                    Stage::Fragment => d
+                        .program
+                        .fragment
+                        .as_deref()
+                        .is_some_and(|k| is_rw(k, false, s.slot, s.stage)),
+                    Stage::Task => d
+                        .program
+                        .task
+                        .as_deref()
+                        .is_some_and(|k| is_rw(k, false, s.slot, s.stage)),
+                    Stage::Mesh => d
+                        .program
+                        .mesh
+                        .as_deref()
+                        .is_some_and(|k| is_rw(k, false, s.slot, s.stage)),
+                    Stage::Compute | Stage::Geometry => false,
+                };
+                if rw {
+                    writes.push((s.address, s.address.saturating_add(u64::from(s.size))));
+                }
+            }
+        }
+        for d in &detail.dispatches {
+            for s in &d.sbufs {
+                if s.stage == Stage::Compute
+                    && s.size != 0
+                    && s.address != 0
+                    && is_rw(&d.program, false, s.slot, s.stage)
+                {
+                    writes.push((s.address, s.address.saturating_add(u64::from(s.size))));
+                }
+            }
+        }
+        writes
     }
 
     /// [`Renamer::note_rw`] with `rw_of(program key, vertex, slot)` saying whether the program may write the binding.
@@ -273,9 +346,6 @@ impl Renamer {
         let mut visit = |st: &mut State, kind: u8, i: usize, j: usize| {
             if kind == 0 {
                 let Some(d) = detail.draws.get(i) else { return };
-                if d.args.is_mesh() {
-                    return;
-                }
                 let Some(s) = d.sbufs.get(j) else { return };
                 match s.stage {
                     Stage::Vertex => look(st, Ok(&d.program.vertex), true, s),
@@ -284,7 +354,17 @@ impl Renamer {
                             look(st, Ok(k), false, s);
                         }
                     }
-                    _ => {}
+                    Stage::Task => {
+                        if let Some(k) = &d.program.task {
+                            look(st, Ok(k), false, s);
+                        }
+                    }
+                    Stage::Mesh => {
+                        if let Some(k) = &d.program.mesh {
+                            look(st, Ok(k), false, s);
+                        }
+                    }
+                    Stage::Compute | Stage::Geometry => {}
                 }
             } else if let Some(d) = detail.dispatches.get(i)
                 && let Some(s) = d.sbufs.get(j)
@@ -435,27 +515,14 @@ pub(super) fn others(detail: &FrameDetail) -> Vec<(u64, u64)> {
                 count,
                 ..
             } => add(address, u64::from(count) << index_type.min(2)),
-            DrawArgs::ArraysIndirect { indirect } | DrawArgs::MeshTasksIndirect { indirect } => {
-                add(indirect, 32);
-            }
-            DrawArgs::IndexedIndirect {
-                address, indirect, ..
-            } => {
+            DrawArgs::IndexedIndirect { address, .. } => {
                 add(address, UNKNOWN_BYTES);
-                add(indirect, 32);
             }
             DrawArgs::MultiIndirectCount {
-                index,
-                indirect,
-                count,
-                max,
-                stride,
+                index: Some((_, a)),
+                ..
             } => {
-                if let Some((_, a)) = index {
-                    add(a, UNKNOWN_BYTES);
-                }
-                add(indirect, u64::from(max).saturating_mul(stride.max(32)));
-                add(count, 4);
+                add(a, UNKNOWN_BYTES);
             }
             _ => {}
         }
@@ -463,9 +530,6 @@ pub(super) fn others(detail: &FrameDetail) -> Vec<(u64, u64)> {
     for d in &detail.dispatches {
         for u in &d.ubos {
             add(u.address, u64::from(u.size));
-        }
-        if let Some(a) = d.indirect {
-            add(a, 12);
         }
     }
     for c in &detail.copies {
